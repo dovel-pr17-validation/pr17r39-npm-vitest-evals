@@ -1,0 +1,178 @@
+# @vitest-evals/harness-openai-agents
+
+`@openai/agents`-focused harness adapter for `vitest-evals`.
+
+## Install
+
+```sh
+npm install -D @openai/agents vitest-evals @vitest-evals/harness-openai-agents
+```
+
+## Usage
+
+```ts
+import { expect } from "vitest";
+import { Runner } from "@openai/agents";
+import { openaiAgentsHarness } from "@vitest-evals/harness-openai-agents";
+import {
+  createJudge,
+  describeEval,
+  toolCalls,
+} from "vitest-evals";
+
+const harness = openaiAgentsHarness({
+  agent: () => createClassifierAgent(),
+  runner: () =>
+    new Runner({
+      modelProvider,
+      tracingDisabled: true,
+    }),
+});
+
+describeEval("classifier agent", { harness }, (it) => {
+  it("classifies a bottle", async ({ run }) => {
+    const result = await run("Classify bottle bt_123");
+
+    expect(result.output).toMatchObject({
+      label: "bourbon",
+    });
+    expect(toolCalls(result).map((call) => call.name)).toContain(
+      "lookup_bottle",
+    );
+  });
+});
+```
+
+The adapter calls `runner.run(agent, input, options)` by default. It forwards
+artifact helpers and the abort signal through the run options, then normalizes
+the `RunResult` into the standard `HarnessRun` shape.
+
+If your application has a custom entrypoint, wire it directly:
+
+```ts
+const harness = openaiAgentsHarness({
+  agent: () => createClassifierAgent(),
+  runner: () => new Runner({ modelProvider, tracingDisabled: true }),
+  run: async ({ agent, input, runner, runOptions }) => {
+    const result = await runBottleClassifier({
+      agent,
+      runner,
+      input,
+      runOptions,
+    });
+
+    return {
+      output: result.classification,
+    };
+  },
+});
+```
+
+`agent` and `runner` can be objects or per-run factories. An `agent` factory
+receives the per-run input before the adapter instruments local function tools.
+Use that when an agent needs scenario-specific tool closures or instructions
+while staying on the native replay path:
+
+```ts
+const harness = openaiAgentsHarness({
+  agent: ({ input }) =>
+    createClassifierAgent({
+      bottleId: parseBottleId(input),
+    }),
+  runner: () => new Runner({ modelProvider, tracingDisabled: true }),
+  toolReplay: {
+    lookup_bottle: true,
+  },
+});
+```
+
+`run` executes the OpenAI agent under test. Judges are created separately; keep
+judge prompts on the judge and model calls on a judge harness instead of
+putting a judge model call on the app harness.
+
+```ts
+import { openaiAgentsJudgeHarness } from "@vitest-evals/harness-openai-agents";
+import { describeEval, FactualityJudge } from "vitest-evals";
+
+const judgeHarness = openaiAgentsJudgeHarness({
+  model: "gpt-4.1-mini",
+  temperature: 0,
+});
+const factualityJudge = FactualityJudge({ judgeHarness });
+
+describeEval("classifier agent", {
+  harness,
+  judges: [factualityJudge],
+});
+```
+
+The adapter provides:
+
+- native `Runner.run(agent, input, options)` execution
+- support for existing agents/runners or per-run `agent` and `runner` factories
+- a `run` escape hatch for app-specific entrypoints
+- normalized assistant output, transcript events, usage, timings, errors, and
+  replay-friendly metadata
+- app-facing `run.output` from native `finalOutput`, a custom `run()` result's
+  `output`, or an explicit `output` selector; native OpenAI Agents `output`
+  items stay in the normalized session transcript
+- native app output is accepted only when it is already JSON-safe; non-JSON
+  values require an explicit `output` selector
+- opt-in replay metadata for local function tools configured with `toolReplay`
+
+Successful tool-call transcripts come from OpenAI Agents generated items:
+`newItems` first, then `output` only when it contains recognizable SDK
+model-output items. SDK `history` is used as a complete-history source when no
+generated items are available. Runtime wrappers can enrich matching run items
+with execution and replay metadata, and they provide transcript events for
+custom entrypoints that return no provider items.
+
+## Tool Replay
+
+Replay is configured globally in Vitest via environment variables:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    env: {
+      VITEST_EVALS_REPLAY_MODE: "auto",
+      VITEST_EVALS_REPLAY_DIR: ".vitest-evals/recordings",
+    },
+  },
+});
+```
+
+Then opt local function tools into replay by name:
+
+```ts
+import { Agent, Runner, tool } from "@openai/agents";
+import { openaiAgentsHarness } from "@vitest-evals/harness-openai-agents";
+
+const lookupBottle = tool({
+  name: "lookup_bottle",
+  description: "Look up bottle facts.",
+  parameters: lookupBottleSchema,
+  async execute({ bottleId }) {
+    return fetchBottleFacts(bottleId);
+  },
+});
+
+const harness = openaiAgentsHarness({
+  agent: () => new Agent({ name: "classifier", tools: [lookupBottle] }),
+  runner: () => new Runner({ modelProvider, tracingDisabled: true }),
+  toolReplay: {
+    lookup_bottle: true,
+  },
+});
+```
+
+`toolReplay` is keyed by the OpenAI tool name. Values can be `true` or the
+standard replay config object with `key`, `sanitize`, and `version` callbacks.
+
+Hosted OpenAI tools are still normalized from the SDK run items when they are
+present in `newItems`, but replay recording is only automatic for local
+function tools that execute in the application process.
+
+See the workspace demo app in `apps/demo-openai-agents`.

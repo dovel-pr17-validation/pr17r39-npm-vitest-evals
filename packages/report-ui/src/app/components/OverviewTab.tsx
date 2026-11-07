@@ -1,0 +1,276 @@
+import type { HarnessRun, ReportCase } from "@vitest-evals/core";
+import {
+  caseExpected,
+  caseInput,
+  formatDuration,
+  formatNumber,
+  judgeRunsForCase,
+  summarizeRuns,
+} from "../model";
+import {
+  type UsageCost,
+  estimateWorkspaceUsageCost,
+  formatCostTotal,
+} from "../pricing";
+import { useReportMeta } from "../report-meta";
+import { EmptyState, cx } from "../ui";
+import { CostHelp } from "./CostHelp";
+import { DetailContent, DetailSection } from "./DetailLayout";
+import { FailureList } from "./FailureList";
+import { JsonInspector } from "./JsonInspector";
+import { Fact, FactsGrid, ScoreValue } from "./ReportPrimitives";
+
+export function OverviewTab({
+  testCase,
+  run,
+}: {
+  testCase: ReportCase;
+  run: HarnessRun | undefined;
+}) {
+  const input = caseInput(testCase);
+  const expected = caseExpected(testCase);
+  const showInput = input !== undefined && input !== "";
+  const showExpected = expected !== undefined && expected !== "";
+
+  const datasetTitle =
+    showInput && showExpected ? "Dataset" : showInput ? "Input" : "Expected";
+
+  return (
+    <DetailContent>
+      {showInput || showExpected ? (
+        <DetailSection title={datasetTitle}>
+          <div
+            className={cx(
+              "grid gap-4",
+              showInput && showExpected ? "lg:grid-cols-2" : "",
+            )}
+          >
+            {showInput ? (
+              <div className="min-w-0">
+                {showInput && showExpected ? (
+                  <p className="mb-2 text-[0.68rem] font-semibold uppercase text-muted">
+                    Input
+                  </p>
+                ) : null}
+                <JsonInspector value={input} />
+              </div>
+            ) : null}
+            {showExpected ? (
+              <div className="min-w-0">
+                {showInput && showExpected ? (
+                  <p className="mb-2 text-[0.68rem] font-semibold uppercase text-muted">
+                    Expected
+                  </p>
+                ) : null}
+                <JsonInspector value={expected} />
+              </div>
+            ) : null}
+          </div>
+        </DetailSection>
+      ) : null}
+      <DetailSection title="Output">
+        <JsonInspector value={testCase.eval?.output ?? run?.output} />
+      </DetailSection>
+      <DetailSection title="Judge evidence">
+        <ScoreTable testCase={testCase} />
+      </DetailSection>
+      <details className="min-w-0 border-b border-line-subtle bg-panel p-5 last:border-b-0">
+        <summary className="cursor-pointer text-sm font-semibold outline-none hover:text-ink focus-visible:outline focus-visible:outline-1 focus-visible:outline-selected-line">
+          Usage
+        </summary>
+        <div className="mt-3">
+          <UsageGrid testCase={testCase} run={run} />
+        </div>
+      </details>
+      {testCase.failureMessages.length > 0 ? (
+        <DetailSection title="Failures">
+          <FailureList messages={testCase.failureMessages} />
+        </DetailSection>
+      ) : null}
+    </DetailContent>
+  );
+}
+
+function ScoreTable({ testCase }: { testCase: ReportCase }) {
+  const scores = testCase.eval?.scores ?? [];
+  if (scores.length === 0) {
+    return <EmptyState>No score records</EmptyState>;
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[520px] table-fixed border-collapse text-sm">
+        <thead className="text-left text-xs font-semibold uppercase text-muted-strong">
+          <tr>
+            <th className="w-[190px] border-b border-line-subtle px-2 py-2">
+              Judge
+            </th>
+            <th className="w-[92px] border-b border-line-subtle px-2 py-2 text-right">
+              Score
+            </th>
+            <th className="border-b border-line-subtle px-2 py-2">Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          {scores.map((score, index) => (
+            <tr key={`${score.name ?? "score"}-${index}`}>
+              <td className="truncate border-b border-line-subtle px-2 py-2">
+                {score.name ?? "Score"}
+              </td>
+              <td className="border-b border-line-subtle px-2 py-2 text-right">
+                <ScoreValue score={score.score} />
+              </td>
+              <td className="border-b border-line-subtle px-2 py-2">
+                <ScoreEvidence metadata={score.metadata} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ScoreEvidence({
+  metadata,
+}: {
+  metadata: Record<string, unknown> | undefined;
+}) {
+  if (!metadata) {
+    return <span className="text-muted">n/a</span>;
+  }
+
+  const rationale = stringMetadata(metadata.rationale);
+  const matchedTools = stringListMetadata(metadata.matchedTools);
+  const output = metadata.output;
+  const remainingMetadata = omitMetadata(metadata, [
+    "rationale",
+    "matchedTools",
+    "output",
+  ]);
+
+  return (
+    <div className="grid gap-1.5">
+      {rationale ? (
+        <p className="max-w-[72ch] text-sm leading-relaxed text-ink">
+          {rationale}
+        </p>
+      ) : null}
+      {matchedTools.length > 0 ? (
+        <EvidenceLine label="matched tools" value={matchedTools.join(", ")} />
+      ) : null}
+      {output !== undefined ? (
+        <EvidenceLine label="output" value={compactJson(output)} />
+      ) : null}
+      {Object.keys(remainingMetadata).length > 0 ? (
+        <details>
+          <summary className="cursor-pointer text-xs font-semibold uppercase text-muted-strong outline-none hover:text-ink focus-visible:outline focus-visible:outline-1 focus-visible:outline-selected-line">
+            Metadata
+          </summary>
+          <code className="mt-1 block break-words font-mono text-xs text-code">
+            {compactJson(remainingMetadata)}
+          </code>
+        </details>
+      ) : null}
+      {!rationale &&
+      matchedTools.length === 0 &&
+      output === undefined &&
+      Object.keys(remainingMetadata).length === 0 ? (
+        <span className="text-muted">n/a</span>
+      ) : null}
+    </div>
+  );
+}
+
+function EvidenceLine({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-0.5 text-xs">
+      <span className="font-semibold uppercase text-muted-strong">{label}</span>
+      <span className="min-w-0 break-words font-mono text-code">{value}</span>
+    </div>
+  );
+}
+
+function UsageGrid({
+  testCase,
+  run,
+}: {
+  testCase: ReportCase;
+  run: HarnessRun | undefined;
+}) {
+  const { pricing } = useReportMeta();
+  const usage = run?.usage;
+  const judgeRuns = judgeRunsForCase(testCase);
+  const app = summarizeRuns(run ? [run] : []);
+  const judge = summarizeRuns(judgeRuns);
+  const appCost = estimateWorkspaceUsageCost(run ? [run.usage] : [], pricing);
+  const judgeCost = estimateWorkspaceUsageCost(
+    judgeRuns.map((judgeRun) => judgeRun.usage),
+    pricing,
+  );
+  const totalCost = estimateWorkspaceUsageCost(
+    [
+      ...(run ? [run.usage] : []),
+      ...judgeRuns.map((judgeRun) => judgeRun.usage),
+    ],
+    pricing,
+  );
+  const costValue = (cost: UsageCost | undefined) =>
+    cost ? (
+      <span className="inline-flex items-center gap-1.5">
+        <span>{formatCostTotal(cost)}</span>
+        <CostHelp cost={cost} pricing={pricing} />
+      </span>
+    ) : (
+      "n/a"
+    );
+
+  return (
+    <FactsGrid compact>
+      <Fact label="App tokens" value={formatNumber(app.tokens)} />
+      <Fact label="Judge tokens" value={formatNumber(judge.tokens)} />
+      <Fact
+        label="Total tokens"
+        value={formatNumber(app.tokens + judge.tokens)}
+      />
+      <Fact label="App cost" value={costValue(appCost)} />
+      <Fact label="Judge cost" value={costValue(judgeCost)} />
+      <Fact label="Total cost" value={costValue(totalCost)} />
+      <Fact label="App provider" value={usage?.provider ?? "n/a"} />
+      <Fact label="App model" value={usage?.model ?? "n/a"} />
+      <Fact label="Retries" value={formatNumber(usage?.retries)} />
+      <Fact label="Run time" value={formatDuration(run?.timings?.totalMs)} />
+    </FactsGrid>
+  );
+}
+
+function compactJson(value: unknown) {
+  const raw = JSON.stringify(value);
+  if (!raw) {
+    return "";
+  }
+  return raw.length > 160 ? `${raw.slice(0, 157)}...` : raw;
+}
+
+function stringMetadata(value: unknown) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function stringListMetadata(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => (typeof item === "string" ? item : undefined))
+    .filter((item): item is string => Boolean(item));
+}
+
+function omitMetadata(
+  metadata: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> {
+  const omitted = new Set(keys);
+  return Object.fromEntries(
+    Object.entries(metadata).filter(([key]) => !omitted.has(key)),
+  );
+}

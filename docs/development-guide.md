@@ -1,0 +1,246 @@
+# Development Guide
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- `pnpm`
+- TypeScript
+- familiarity with Vitest
+
+### Setup
+
+```bash
+pnpm install
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+## Current Product Shape
+
+The repository is now harness-first:
+
+- new suites should use `describeEval(...)` from `vitest-evals`
+- harness adapters live in first-party packages such as
+  `@vitest-evals/harness-pi-ai`
+- root helper logic should be judge-first
+- scorer-first support still exists, but it is isolated under
+  `vitest-evals/legacy`
+
+When changing behavior, decide first which surface you are touching:
+
+- root harness/judge API
+- reporter output
+- shared primitives, JSON artifact schemas, and collection
+- GitHub JSON post-processing output
+- a first-party harness package
+- legacy scorer compatibility
+
+That split should stay explicit in both code and documentation.
+
+## Workflow
+
+1. Read the relevant package and tests first.
+2. Decide whether the change belongs in root, a harness package, or `legacy`.
+3. Add or update tests before broad refactors.
+4. Keep examples and docs aligned with the change.
+5. Run the smallest useful verification set locally before committing.
+
+## Key Package Boundaries
+
+### `packages/vitest-evals`
+
+Owns:
+
+- harness execution and normalization helpers
+- re-exports for normalized core types and read helpers
+- root `describeEval(...)`
+- judge helpers and matcher APIs
+- reporter integration
+- legacy compatibility exports
+
+### `packages/harness-ai-sdk`
+
+Owns:
+
+- adapting AI SDK results into `HarnessRun`
+- AI SDK specific usage/session normalization
+
+### `packages/harness-openai-agents`
+
+Owns:
+
+- adapting OpenAI Agents SDK `Runner.run(...)` results into `HarnessRun`
+- OpenAI Agents specific `RunResult` and function-tool normalization
+- replay metadata for opt-in local function tools
+
+### `packages/harness-pi-ai`
+
+Owns:
+
+- adapting `pi-ai` style agents into `HarnessRun`
+- wrapped tool runtime injection
+- tool replay/VCR behavior
+
+### `packages/core`
+
+Owns:
+
+- dependency-light primitives shared across package boundaries
+- schemas and TypeScript types for normalized runs, sessions, traces, and
+  persisted Vitest JSON eval artifacts
+- `task.meta.eval` and `task.meta.harness` parsing
+- full-fidelity collection of multiple JSON reports for rich consumers
+- Node-only path, glob, directory, and JSON file readers under
+  `@vitest-evals/core/node`
+- tolerant preservation of provider-specific JSON metadata
+
+Use this package when code needs shared data contracts without depending on
+Vitest lifecycle APIs. Keep `describeEval(...)`, matchers, and the terminal
+reporter in `packages/vitest-evals`; keep GitHub-specific summaries,
+annotations, and Check Run payloads in `packages/github-reporter`.
+
+Keep `packages/core/src/index.ts` as a public barrel. Normalized harness run,
+session, trace, and helper contracts belong under `src/harness`; Vitest JSON
+parsing, eval task metadata, and collected report workspaces belong under
+`src/report`; primitive JSON and schema utilities stay at the package root.
+
+### `packages/report-ui`
+
+Owns:
+
+- the `vitest-evals serve` local report CLI
+- the static HTTP server that exposes `/data/workspace.json`
+- the React SPA for runs, cases, scores, sessions, tool calls, and traces
+- browser-only presentation helpers over the shared `ReportWorkspace` model
+
+Keep the UI package focused on interaction and local serving. Shared artifact
+schemas and collection behavior belong in `packages/core`; CI-specific
+rendering belongs in `packages/github-reporter`.
+
+In a source checkout, build the package before invoking the published-style
+binary through `pnpm exec vitest-evals serve ...`; the workspace bin shim loads
+the built `packages/vitest-evals/dist/cli.mjs`.
+
+### `packages/github-reporter`
+
+Owns:
+
+- reading Vitest JSON reports that include eval task metadata
+- the native `getsentry/vitest-evals` action implementation
+- merging sharded JSON reports into one combined report
+- rendering GitHub Actions job summaries
+- rendering workflow-command annotations
+- optional GitHub Check Run publishing
+
+Keep this package file/artifact based. The public GitHub surface is the action,
+so workflow docs should show `uses: getsentry/vitest-evals@v0`
+instead of package CLI commands. Do not make it depend on Vitest's live reporter
+lifecycle unless the JSON contract stops carrying the metadata core needs.
+
+## Demo Apps
+
+`apps/demo-pi`, `apps/demo-ai-sdk`, and `apps/demo-openai-agents` own live demo
+eval coverage and any app-local refund fixtures they need. Keep them realistic;
+they are part of the product story, not just smoke tests. `packages/` is for
+real package surfaces.
+
+## Adding a New Judge
+
+Root-level evaluation logic should usually be implemented as a named judge:
+
+```ts
+import { createJudge, type JudgeOptions, type JsonValue } from "vitest-evals";
+
+export const DomainJudge = createJudge(
+  "DomainJudge",
+  async ({
+    toolCalls,
+    expectedTool,
+  }: JudgeOptions<
+    unknown,
+    JsonValue | undefined,
+    { expectedTool: string }
+  >) => ({
+    score: toolCalls.some((call) => call.name === expectedTool) ? 1 : 0,
+    metadata: {
+      rationale: `Expected tool ${expectedTool}`,
+    },
+  },
+);
+```
+
+Prefer judges when:
+
+- the logic should work with normalized harness data
+- the result should compose with automatic suite-level judges
+- the logic should work with `toSatisfyJudge(...)` or suite-level `judges`
+
+## Adding a New Harness Adapter
+
+Keep harness adapters thin. Core should own the generic model. A harness
+package should focus on:
+
+- executing the target runtime through its normal entrypoint
+- capturing transcript events, usage, timings, and errors
+- returning a normalized `HarnessRun`
+- exposing narrow escape hatches like `run` and a typed `output` selector
+
+Follow [API design policy](../policies/api-design.md): prefer one public
+spelling per concept, value-or-factory inputs for lifecycle choices, and strong
+types for optional capabilities. Judges own assessment-specific provider calls;
+do not put judge prompts or judge model calls on the harness.
+
+Do not push core reporter or assertion behavior into a harness package unless
+the runtime truly requires it.
+
+## Maintaining Legacy Compatibility
+
+If a change only exists to support scorer-first suites, keep it under
+`packages/vitest-evals/src/legacy/...` and document it as legacy behavior.
+
+Legacy APIs include:
+
+- `describeEval(...)` from `vitest-evals/legacy`
+- `toEval(...)`
+- `evaluate(...)`
+- scorer implementations such as `ToolCallScorer`
+
+Do not reintroduce scorer-first guidance into the root package docs or examples.
+
+## Verification
+
+Common commands:
+
+```bash
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm evals
+```
+
+For targeted work, prefer narrow verification:
+
+- reporter changes: run reporter tests
+- GitHub reporter changes: run `packages/github-reporter/src/report.test.ts`
+- harness changes: run the relevant harness package tests
+- demo app changes: run `pnpm evals` or a filtered app eval command
+- legacy changes: run the moved tests under `packages/vitest-evals/src/legacy`
+- shared core changes: run `packages/core/src/index.test.ts` and the GitHub
+  reporter tests
+- report UI changes: run `packages/report-ui/src/server.test.ts`,
+  `packages/report-ui/src/app/model.test.ts`, and the report UI build
+
+## Documentation Expectations
+
+When the product shape changes, update:
+
+- the repo root `README.md`
+- `packages/vitest-evals/README.md`
+- the relevant docs in `docs/`
+- example apps or packages when the authoring model changes
+
+The repo should read as harness-first even if the legacy compatibility layer
+continues to exist.

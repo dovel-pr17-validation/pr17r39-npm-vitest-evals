@@ -1,0 +1,175 @@
+# @vitest-evals/harness-pi-ai
+
+`pi-ai`-focused harness adapter for `vitest-evals`.
+
+## Install
+
+```sh
+npm install -D vitest-evals @vitest-evals/harness-pi-ai
+```
+
+## Usage
+
+```ts
+import { expect } from "vitest";
+import { piAiHarness } from "@vitest-evals/harness-pi-ai";
+import {
+  createJudge,
+  describeEval,
+  toolCalls,
+} from "vitest-evals";
+
+const harness = piAiHarness({
+  agent: () => createRefundAgent(),
+  toolReplay: {
+    lookupInvoice: true,
+  },
+});
+
+describeEval("refund agent", { harness }, (it) => {
+  it("approves a refundable invoice", async ({ run }) => {
+    const result = await run("Refund invoice inv_123");
+
+    expect(result.output).toMatchObject({
+      status: "approved",
+    });
+    expect(toolCalls(result).map((call) => call.name)).toEqual([
+      "lookupInvoice",
+      "createRefund",
+    ]);
+  });
+});
+```
+
+`run` executes the Pi agent under test. Judges are created separately; keep
+judge prompts on the judge and model calls on a judge harness instead of
+putting a judge model call on the app harness.
+
+```ts
+import { getModel } from "@mariozechner/pi-ai";
+import { piAiJudgeHarness } from "@vitest-evals/harness-pi-ai";
+import { describeEval, FactualityJudge } from "vitest-evals";
+
+const judgeHarness = piAiJudgeHarness({
+  model: getModel("anthropic", "claude-sonnet-4-5"),
+  temperature: 0,
+});
+const factualityJudge = FactualityJudge({ judgeHarness });
+
+describeEval("refund agent", {
+  harness,
+  judges: [factualityJudge],
+});
+```
+
+If the agent already exposes its own tools, the adapter will infer them from
+the agent by default. If your existing Pi Mono agent already exposes its own
+entrypoint, wire that up directly and let the harness provide the runtime
+seam:
+
+```ts
+const harness = piAiHarness({
+  agent: () => createRefundAgent(),
+  run: ({ agent, input, runtime }) => agent.execute(input, runtime),
+});
+```
+
+If the agent already implements `run(input, runtime)`, you can omit `run` and
+the harness will call that method automatically.
+
+`agent` can be an object or a per-run factory. The factory receives the per-run
+input before the adapter infers and instruments native agent tools. Use that
+for scenario-specific instructions or tool closures without leaving the default
+replay path:
+
+```ts
+const harness = piAiHarness({
+  agent: ({ input }) =>
+    createRefundAgent({
+      instructions: buildInstructions(input),
+    }),
+  toolReplay: {
+    lookupInvoice: true,
+  },
+});
+```
+
+You should not need to configure output/session/usage basics for the normal Pi
+path. Pass your agent and let the adapter infer both the toolset and the
+normalized result from the agent transcript. When your app returns a structured
+domain value, return it as `output`.
+
+If the agent completely hides its tools, `tools` still exists as a low-level
+override:
+
+```ts
+const harness = piAiHarness({
+  agent: () => createRefundAgent(),
+  tools: hiddenAgentTools,
+});
+```
+
+If you do have an unusual wrapper around the agent result, make the app-facing
+value explicit in the `run()` return:
+
+```ts
+const harness = piAiHarness({
+  agent: () => createWrappedRefundAgent(),
+  run: async ({ agent, input, runtime }) => ({
+    output: await agent.run(input, runtime),
+  }),
+});
+```
+
+The adapter provides:
+
+- a runtime/tool injection seam for an existing agent
+- normalized session capture from emitted events and wrapped tool calls
+- usage capture plus typed app output from `run()` results that return `output`
+- native app output is accepted only when it is already JSON-safe; arbitrary
+  fields, primitive raw results, and non-JSON values require an explicit
+  `output` selector
+- opt-in tool replay/recording from harness-level `toolReplay`
+
+See the workspace demo in `apps/demo-pi`.
+
+## Tool Replay
+
+Replay is configured globally in Vitest via environment variables:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    env: {
+      VITEST_EVALS_REPLAY_MODE: "auto",
+      VITEST_EVALS_REPLAY_DIR: ".vitest-evals/recordings",
+    },
+  },
+});
+```
+
+Then opt individual tools into recording/replay from the harness:
+
+```ts
+const harness = piAiHarness({
+  agent: () => createRefundAgent(),
+  toolReplay: {
+    lookupInvoice: true,
+  },
+});
+```
+
+When an agent exposes both a native Pi tool and a runtime tool with the same
+name, a native tool call records in its own cassette namespace. Runtime calls of
+that same name are treated as implementation details while the native tool is
+executing, so delegated runtime calls do not create duplicate transcript entries
+or overwrite the native recording.
+
+Supported modes:
+
+- `auto` (default): replay when present, otherwise call live and write a recording
+- `record`: always call live and overwrite the recording
+- `off`: never read or write recordings
+- `strict`: require an existing recording and fail if it is missing

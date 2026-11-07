@@ -1,0 +1,128 @@
+---
+title: Custom Judges
+description: Create reusable rubrics and thresholds for domain-specific scoring.
+editUrl: false
+---
+
+Use `createJudge()` when a rubric should be reused across suites. A custom
+judge receives the same normalized `JudgeContext` as built-ins: input, output,
+tool calls, session, run, app harness, and a curried `runJudge` function when
+the suite has a judge harness. Add explicit judge parameters to your custom
+judge options when a matcher call needs case-specific criteria.
+
+## Usage
+
+Keep deterministic checks close to the normalized output. Return stable score
+units and JSON-safe metadata that explains the result.
+
+```ts title="evals/judges/capitalJudge.ts"
+import { createJudge } from "vitest-evals";
+
+export const CapitalJudge = createJudge<string, string>(
+  "CapitalJudge",
+  async ({ output }) => {
+    const passed = output.toLowerCase().includes("paris");
+
+    return {
+      score: passed ? 1 : 0,
+      metadata: {
+        rationale: passed
+          ? "The answer names Paris."
+          : `Expected Paris, got: ${output}`,
+      },
+    };
+  },
+);
+```
+
+Prefer `0` and `1` for pass/fail checks. Reserve intermediate values for true
+partial credit.
+
+## Suite Use
+
+Attach reusable judges at the suite level when every case should satisfy the
+same contract.
+
+```ts title="evals/capital.eval.ts"
+import { describeEval } from "vitest-evals";
+import { qaHarness } from "./qaHarness";
+import { CapitalJudge } from "./judges/capitalJudge";
+
+describeEval("capital questions", {
+  harness: qaHarness,
+  judges: [CapitalJudge],
+  judgeThreshold: 1,
+});
+```
+
+Use explicit assertions when a single case needs an extra judge or a different
+threshold.
+
+```ts title="evals/capital.eval.ts"
+await expect(result).toSatisfyJudge(CapitalJudge, {
+  threshold: null,
+});
+```
+
+## Model-Backed Judges
+
+If a custom judge needs an LLM call, configure a `judgeHarness` on the matcher,
+the judge object, or the suite, then call `ctx.runJudge(...)` from the judge.
+Core curries the current abort signal into that function. Each call returns the
+judge output and records the normalized judge run in report metadata. Multiple
+calls remain separate runs. Matcher options win over a judge default, and a judge
+default wins over the suite default. Explicit matcher calls can also reuse a
+single unambiguous judge-level harness from the suite's automatic judges, but
+automatic judges do not inherit inferred harnesses from sibling judges. Leave
+`judgeHarness` unset for suites that only use deterministic judges.
+
+```ts title="evals/judges/rubricJudge.ts"
+import { createJudge } from "vitest-evals";
+
+export const RubricJudge = createJudge({
+  name: "RubricJudge",
+  async assess(ctx) {
+    if (!ctx.runJudge) {
+      throw new Error("RubricJudge requires a configured judgeHarness.");
+    }
+
+    const verdict = await ctx.runJudge({
+      prompt: `Grade this answer: ${JSON.stringify(ctx.output)}`,
+      responseFormat: { type: "json" },
+    });
+
+    return parseRubricVerdict(verdict);
+  },
+});
+```
+
+Return a full `HarnessRun` from a custom judge harness when the provider exposes
+usage. Set `usage.costUsd` from provider-reported cost or a suite estimate.
+Omit it when cost is unknown; zero means the run is known to be free. GitHub
+reports show application, judge, and combined token and cost totals.
+Provider-specific pricing details can remain under `usage.metadata`.
+
+```ts title="evals/judges/judgeHarness.ts"
+const judgeHarness = createJudgeHarness({
+  name: "rubric-model",
+  async run(input) {
+    const response = await callJudgeModel(input);
+    return {
+      output: response.text,
+      session: response.session,
+      usage: {
+        inputTokens: response.usage.inputTokens,
+        outputTokens: response.usage.outputTokens,
+        costUsd: response.costUsd,
+      },
+      errors: [],
+    };
+  },
+});
+```
+
+## Failure Behavior
+
+Custom judges fail when the returned score falls below the active threshold.
+Use explicit thresholds for domain rubrics so a future reader can see whether a
+score is advisory or blocking.

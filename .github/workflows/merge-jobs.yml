@@ -1,0 +1,85 @@
+# This workflow will do a clean install of node dependencies, build the source code and run tests
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-nodejs-with-github-actions
+
+name: Post-merge tasks
+
+on:
+  push:
+    branches: ["main", "release/*"]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      # pnpm/action-setup@v4
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+        name: Install pnpm
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        name: Setup pnpm cache
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Check release config
+        run: pnpm release:check
+
+      - name: Run linter
+        run: pnpm lint
+
+      - name: Run tests
+        run: pnpm test:ci
+
+      - name: Build
+        run: pnpm build
+
+      # Fails on a stale bundle, so Craft does not publish a release branch
+      # whose tag would ship an outdated Action.
+      - name: Check GitHub Action bundle
+        run: sh scripts/check-action-bundle.sh
+
+      - name: Pack NPM Tarballs
+        run: |
+          mkdir -p artifacts
+          pnpm --filter @vitest-evals/core pack --pack-destination artifacts
+          pnpm --filter @vitest-evals/report-ui pack --pack-destination artifacts
+          pnpm --filter vitest-evals pack --pack-destination artifacts
+          pnpm --filter @vitest-evals/harness-ai-sdk pack --pack-destination artifacts
+          pnpm --filter @vitest-evals/harness-openai-agents pack --pack-destination artifacts
+          pnpm --filter @vitest-evals/harness-pi-ai pack --pack-destination artifacts
+          pnpm --filter @vitest-evals/github-reporter pack --pack-destination artifacts
+          ls -la artifacts
+
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.sha }}
+          path: artifacts/*.tgz
+          if-no-files-found: error

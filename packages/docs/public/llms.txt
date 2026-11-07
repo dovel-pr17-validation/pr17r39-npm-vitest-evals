@@ -1,0 +1,804 @@
+# vitest-evals
+
+> Harness-backed AI evaluation tests on top of Vitest.
+
+`vitest-evals` lets teams write evals as ordinary Vitest tests while still
+capturing the AI-specific data needed for judges, replay, terminal reporting,
+and GitHub Actions reporting. The public API is harness-first and judge-first:
+bind one harness to a suite, call the explicit `run(input)` fixture inside each
+test, assert on the typed app output, and let normalized session data flow to
+judges and reporters.
+
+Canonical docs:
+
+- Overview: https://vitest-evals.sentry.dev/
+- Documentation: https://vitest-evals.sentry.dev/docs
+- GitHub reporting: https://vitest-evals.sentry.dev/docs/github
+- API reference: https://vitest-evals.sentry.dev/api
+- Repository: https://github.com/getsentry/vitest-evals
+
+The canonical documentation page routes readers to the right harness, then the
+harness pages follow the same Paris example from app shape through harness
+configuration, eval authoring, and judging.
+
+## When to use this library
+
+Use `vitest-evals` when an eval needs to execute real application or agent code
+and then assert on both:
+
+- the app-facing output returned by the system under test
+- the normalized AI session data produced during the run
+
+The library is designed for deterministic and semi-deterministic AI workflows:
+tool-using agents, structured output flows, customer-support agents, RAG flows,
+multi-step workflows, and CI reporting of eval results.
+
+Do not treat `vitest-evals` as only an LLM grader wrapper. Model-graded checks
+can be implemented as custom judges, but the root shape of the library is:
+
+1. execute the app once through a harness
+2. keep typed app output available to the test
+3. normalize transcript, tool, usage, timing, artifact, and error data
+4. run deterministic or model-backed judges against that one run
+5. publish results through terminal and GitHub reporters
+
+## Packages
+
+Core package:
+
+```sh
+pnpm add -D vitest-evals
+```
+
+First-party harness packages:
+
+```sh
+pnpm add -D @vitest-evals/harness-ai-sdk
+pnpm add -D @vitest-evals/harness-openai-agents
+pnpm add -D @vitest-evals/harness-pi-ai
+```
+
+Package purposes:
+
+- `vitest-evals`: root eval API, judges, harness primitives, reporter,
+  normalized session helpers, and replay helpers.
+- `@vitest-evals/harness-ai-sdk`: adapter for AI SDK results, steps, usage,
+  tool calls, runtime tools, and custom entrypoints.
+- `@vitest-evals/harness-openai-agents`: adapter for OpenAI Agents SDK agents,
+  runners, local tool capture, and replay metadata.
+- `@vitest-evals/harness-pi-ai`: adapter for Pi agents and replay-capable
+  tool execution.
+- `@vitest-evals/core`: shared primitives, schemas, and collection helpers for
+  normalized runs and Vitest JSON eval artifacts. Its `./node` subpath contains
+  shared path, glob, directory, and JSON file readers for report consumers.
+- `@vitest-evals/github-reporter`: implementation package behind the GitHub
+  Action. Most users should consume the action as `getsentry/vitest-evals@v0`.
+- `@vitest-evals/report-ui`: implementation package behind
+  `vitest-evals serve`, the local React SPA for inspecting JSON report
+  artifacts, harness sessions, tool calls, and traces.
+
+## Configure Vitest
+
+Use a separate command and config for evals so provider timeouts, replay modes,
+eval-only file globs, and eval reporters do not leak into unit tests.
+
+Suggested `package.json` scripts:
+
+```json
+{
+  "scripts": {
+    "evals": "vitest run --config vitest.evals.config.ts",
+    "evals:record": "VITEST_EVALS_REPLAY_MODE=record vitest run --config vitest.evals.config.ts",
+    "evals:strict": "VITEST_EVALS_REPLAY_MODE=strict vitest run --config vitest.evals.config.ts"
+  }
+}
+```
+
+Suggested `vitest.evals.config.ts`:
+
+```ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    include: ["evals/**/*.eval.ts"],
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
+    reporters: ["vitest-evals/reporter"],
+    env: {
+      VITEST_EVALS_REPLAY_MODE:
+        process.env.VITEST_EVALS_REPLAY_MODE ?? "off",
+      VITEST_EVALS_REPLAY_DIR: ".vitest-evals/recordings",
+    },
+  },
+});
+```
+
+## Core mental model
+
+An eval suite has one harness. A harness is an adapter around the system under
+test. It receives input, runs the application, and returns a normalized
+`HarnessRun`.
+
+Each eval test receives a `run(input)` fixture from `describeEval`.
+Calling `run(...)` executes the harness and returns an `EvalHarnessRun`, which
+is a `HarnessRun` with type information tying it back to the suite input,
+output, and harness.
+
+Judges inspect the same run. They should not re-run the app unless they are
+explicitly written to do so. Built-in judges are deterministic contract checks.
+Custom judges can call models, compare output to rubrics, or enforce domain
+rules.
+
+## Minimal suite
+
+```ts
+import { expect } from "vitest";
+import { createJudge, describeEval } from "vitest-evals";
+import { qaHarness } from "./qaHarness";
+
+const CapitalJudge = createJudge<string, string>(
+  "CapitalJudge",
+  async ({ output }) => ({
+    score: output.toLowerCase().includes("paris") ? 1 : 0,
+  }),
+);
+
+describeEval(
+  "capital questions",
+  {
+    harness: qaHarness,
+    judges: [CapitalJudge],
+  },
+  (it) => {
+    it("knows the capital of France", async ({ run }) => {
+      const result = await run("What is the capital of France?");
+
+      expect(result.output).toContain("Paris");
+    });
+  },
+);
+```
+
+## Table-driven evals
+
+Use Vitest's normal table APIs. Keep user-facing input in `input`, and keep
+expected values in the row that owns them.
+
+```ts
+describeEval(
+  "capital questions",
+  {
+    harness: qaHarness,
+    judges: [CapitalJudge],
+  },
+  (it) => {
+    it.for([
+      {
+        name: "France",
+        input: "What is the capital of France?",
+        expectedAnswer: "Paris",
+      },
+      {
+        name: "Japan",
+        input: "What is the capital of Japan?",
+        expectedAnswer: "Tokyo",
+      },
+    ])("$name", async ({ input, expectedAnswer }, { run }) => {
+      const result = await run(input);
+
+      expect(result.output).toContain(expectedAnswer);
+    });
+  },
+);
+```
+
+## Public root API
+
+Import from `vitest-evals` for new suites.
+
+- `describeEval(name, options, callback)`: define a harness-backed eval suite.
+- `createJudge(name, assess)`: create a named judge.
+- `expect(result).toSatisfyJudge(judge, options?)`: run an explicit judge
+  assertion against a harness run, normalized session, or raw output.
+- `ToolCallJudge(config?)`: deterministic tool-call judge.
+- `StructuredOutputJudge(config?)`: deterministic structured-output judge.
+- `formatScores(...)`: format judge results for assertions and reporters.
+- `toolCalls(result)`: flatten tool calls from a normalized run.
+- `assistantMessages(result)`, `userMessages(result)`, `systemMessages(result)`,
+  `toolMessages(result)`, `messagesByRole(result, role)`: filter normalized
+  messages from a run.
+- `createHarness(...)`, `normalizeHarnessRun(...)`: custom harness helpers.
+
+Important root types include:
+
+- `EvalRun`
+- `EvalTestContext`
+- `EvalTestAPI`
+- `EvalHarnessRun`
+- `DescribeEvalOptions`
+- `Judge`
+- `JudgeContext`
+- `JudgeResult`
+- `Harness`
+- `HarnessRun`
+- `NormalizedSession`
+- `TranscriptEvent`
+- `TranscriptMessageEvent`
+- `TranscriptToolCallEvent`
+- `TranscriptToolResultEvent`
+- `UsageSummary`
+- `TimingSummary`
+- `JsonValue`
+
+## Export subpaths
+
+Use these package subpaths when a module wants a narrower import surface.
+
+- `vitest-evals`: primary harness, judge, matcher, and helper API.
+- `vitest-evals/judges`: built-in judges and judge types.
+- `vitest-evals/harness`: harness types, normalization helpers, and session
+  helpers.
+- `vitest-evals/replay`: replay helpers used by first-party harnesses and
+  custom integrations.
+- `vitest-evals/reporter`: Vitest reporter entrypoint.
+
+## Harnesses
+
+A harness owns execution and normalization. The root `Harness` interface is:
+
+```ts
+type Harness<TInput, TOutput> = {
+  name: string;
+  run: (
+    input: TInput,
+    context: HarnessContext,
+  ) => Promise<HarnessRun<TOutput>>;
+};
+```
+
+The context includes:
+
+- `signal`: optional abort signal
+- `artifacts`: mutable JSON-safe artifact record
+- `setArtifact(name, value)`: helper for storing JSON-safe artifacts
+
+Harness output must be normalized into `HarnessRun`:
+
+```ts
+type HarnessRun<TOutput> = {
+  output?: TOutput;
+  session: NormalizedSession;
+  usage: UsageSummary;
+  timings?: TimingSummary;
+  artifacts?: Record<string, JsonValue>;
+  errors: Array<Record<string, JsonValue>>;
+};
+```
+
+Keep normalized data JSON-safe. Do not store class instances, functions,
+Promises, streams, Dates as Date objects, or provider SDK objects directly in
+`session`, `usage`, `artifacts`, or `errors`. Convert them to strings, numbers,
+booleans, arrays, plain objects, or null.
+
+## Custom harness
+
+Use `createHarness(...)` when your app has its own entrypoint. It accepts a
+lightweight result and normalizes it into a full `HarnessRun`.
+
+```ts
+import { createHarness } from "vitest-evals";
+
+export const qaHarness = createHarness<string, string>({
+  name: "qa-app",
+  run: async ({ input, setArtifact }) => {
+    const output = await answerQuestion(input);
+
+    setArtifact("question", { input });
+
+    return {
+      output,
+      messages: [
+        { role: "user", content: input },
+        { role: "assistant", content: output },
+      ],
+      usage: {
+        provider: "openai",
+        model: "gpt-4o-mini",
+      },
+    };
+  },
+});
+```
+
+Lightweight harness results must include one non-empty transcript input:
+
+- `output`: typed app-facing output
+- `events`: ordered transcript events, or
+- `messages`: strict camelCase message transport that normalizes into transcript events
+
+They can also include:
+- `usage`: stable usage units
+- `timings`: timing summary
+- `artifacts`: extra JSON-safe debug/report data
+- `metadata`: session-level metadata
+- `errors`: normalized or raw errors to serialize
+
+## Normalized session data
+
+`NormalizedSession` is the transcript and provider summary consumed by judges
+and reporters:
+
+```ts
+type NormalizedSession = {
+  events: TranscriptEvent[];
+  provider?: string;
+  model?: string;
+  metadata?: Record<string, JsonValue>;
+};
+```
+
+Transcript events are flat and ordered. Message events have `type: "message"`,
+`role`, optional `content`, and optional metadata. Tool-call events have
+`type: "tool_call"`, required `id`, `name`, JSON-safe `arguments`, timings,
+duration, and metadata. Tool-result events have `type: "tool_result"`, required
+`toolCallId`, optional `name`, JSON-safe `content`, optional normalized
+`error`, timings, duration, and metadata.
+
+`UsageSummary` intentionally contains stable usage units:
+
+- `provider`
+- `model`
+- `inputTokens`
+- `outputTokens`
+- `reasoningTokens`
+- `totalTokens`
+- `costUsd`
+- `toolCalls`
+- `retries`
+- `metadata`
+
+Set `costUsd` to the provider-reported cost or the suite's estimate in US
+dollars. Omit it when cost is unknown. Use `0` only when the run is known to be
+free. Keep provider-specific pricing details in `usage.metadata`.
+
+## First-party harness adapters
+
+### AI SDK
+
+Import:
+
+```ts
+import { aiSdkHarness } from "@vitest-evals/harness-ai-sdk";
+```
+
+Use it when the system under test uses the AI SDK. The adapter understands AI
+SDK result shapes, steps, usage, tool calls, runtime tools, and custom
+entrypoints. It can infer app output from JSON-safe `output`, `object`, or
+`text` fields depending on the result shape, and it keeps transcript events and
+tool activity for judges/reporters.
+
+Compatible apps usually expose `run(input, runtime)` or
+`generate(input, runtime)`. Read local tools from `runtime.tools` so the harness
+can replace them with replay-aware wrappers. Pass the AI SDK tool map through
+the harness `tools` option. Use `output` when the production entrypoint returns
+a raw AI SDK result and the eval should assert on a parsed domain object. Omit
+`output` when the app already returns `{ output }` or a full `HarnessRun`.
+
+### OpenAI Agents
+
+Import:
+
+```ts
+import { openaiAgentsHarness } from "@vitest-evals/harness-openai-agents";
+```
+
+Use it when the system under test uses the OpenAI Agents SDK. The adapter runs
+agents or runners, captures transcript events, supports local tool replay
+metadata, preserves app-facing output separately from native output item
+records, and can attach partial runs when execution fails.
+
+Compatible apps expose an `Agent` plus a `Runner`, or factories for both. The
+harness calls `runner.run(agent, input, options)`. Use `runOptions` for turn
+limits and provider-specific runner options. Key `toolReplay` by the OpenAI
+function tool name. Use `output` to parse `result.finalOutput` or project native
+structured output into the app-facing value.
+
+### Pi
+
+Import:
+
+```ts
+import { piAiHarness } from "@vitest-evals/harness-pi-ai";
+```
+
+Use it when the system under test uses Pi agents. The adapter captures
+transcript events, inferred or configured toolsets, usage, and replay
+metadata for opt-in tools.
+
+Compatible apps expose a Pi agent, a `toolset`, or a `run(input, runtime)`
+entrypoint. Keep the native toolset on the agent when it is discoverable; pass
+`tools` only when the app hides the tool surface. Use `runtime.tools` for
+replay-aware execution, `runtime.events` to record assistant messages and usage,
+and return `{ output }` when tests should assert on a parsed domain object.
+Key `toolReplay` by the Pi tool name.
+
+### Custom harness
+
+Use `createHarness<Input, Output>(...)` when the first-party adapters do not
+fit. This is appropriate for workflow engines, RAG pipelines, CLIs, or service
+functions that can return JSON-safe output, ordered events, usage, timings,
+artifacts, or errors without going through a supported SDK adapter.
+
+Return `output` for ordinary Vitest assertions and always return at least one
+ordered `events` item for the run transcript. Message-shaped `messages` are
+accepted only at the custom harness input boundary and are normalized into
+events, including assistant `toolCalls`, `role: "tool"` results keyed by
+`toolCallId`, and AI SDK-style `tool-call`/`tool-result` content parts. Other
+provider content blocks or item streams should adapt those records into
+`events` directly. Use
+`setArtifact(name, value)` for JSON-safe debug details that belong in reports
+but not in the app output contract. Return a full `HarnessRun` only when the app
+needs complete control over session events, usage, timings, artifacts, and
+errors.
+
+## Judges
+
+A judge is a named object with an `assess(ctx)` function. It returns a
+`JudgeResult`:
+
+```ts
+type JudgeResult = {
+  score: number;
+  metadata?: Record<string, JsonValue>;
+};
+```
+
+The common judge context includes:
+
+- `input`
+- `output`
+- `metadata`
+- `run`
+- `session`
+- `toolCalls`
+- `harness`
+- `runJudge` when a judge harness is configured
+- `signal`
+
+Create a deterministic judge:
+
+```ts
+import { createJudge } from "vitest-evals";
+
+export const CapitalJudge = createJudge<string, string>(
+  "CapitalJudge",
+  async ({ output }) => ({
+    score: output.toLowerCase().includes("paris") ? 1 : 0,
+    metadata: {
+      rationale: output.toLowerCase().includes("paris")
+        ? "The answer names Paris."
+        : `Expected Paris, got: ${output}`,
+    },
+  }),
+);
+```
+
+Use suite-level judges when every `run(...)` in the suite should be judged:
+
+```ts
+describeEval(
+  "capital questions",
+  {
+    harness: qaHarness,
+    judges: [CapitalJudge],
+    judgeThreshold: 1,
+  },
+  (it) => {
+    // tests
+  },
+);
+```
+
+Use explicit judge assertions when a single test needs a specific judge:
+
+```ts
+await expect(result).toSatisfyJudge(CapitalJudge);
+```
+
+Set `judgeThreshold: null` or assertion threshold options when you want to
+record judge scores without failing the test on score.
+
+## Built-in judges
+
+`ToolCallJudge()` checks expected tool calls and optional argument constraints.
+Use it when correctness depends on calling the right tools, using the right
+order, avoiding extra calls, or matching arguments.
+
+`StructuredOutputJudge()` checks JSON-safe structured output fields. Use it
+when correctness depends on app-facing output shape or values.
+
+Built-ins other than `FactualityJudge()` are deterministic checks. For a
+model-backed judge, keep the prompt, rubric, parsing, and threshold in the
+judge. Put the provider call in a separate `judgeHarness`, then call it through
+`ctx.runJudge(...)`. This records tokens and cost as judge usage instead of
+application usage.
+
+```ts
+import { aiSdkJudgeHarness } from "@vitest-evals/harness-ai-sdk";
+import { createJudge } from "vitest-evals";
+
+const judgeHarness = aiSdkJudgeHarness({ model: rubricModel });
+
+const RubricJudge = createJudge({
+  name: "RubricJudge",
+  judgeHarness,
+  async assess(ctx) {
+    if (!ctx.runJudge) {
+      throw new Error("RubricJudge requires a judge harness.");
+    }
+
+    const verdict = await ctx.runJudge({
+      prompt: formatRubricPrompt(ctx),
+      responseFormat: { type: "json" },
+    });
+    return parseVerdict(verdict);
+  },
+});
+```
+
+Use a first-party judge harness from the matching adapter package, or
+`createJudgeHarness(...)` for another provider. Return a full `HarnessRun` when
+usage is available. Each `runJudge(...)` call is recorded separately.
+
+## Case criteria guidance
+
+Put case criteria where the API that needs them can read them:
+
+- Put scenario-owned criteria in `input` when the app should see them.
+- Put deterministic expected values in the Vitest case row for direct checks.
+- Pass per-case judge criteria through explicit matcher options.
+- Put suite-wide judge criteria on the judge instance.
+
+Use `metadata` only for normalized output/report diagnostics such as judge
+rationales, replay details, usage metadata, session metadata, or tool metadata.
+
+## Reporter
+
+Use the terminal reporter locally:
+
+```sh
+pnpm evals
+```
+
+For JSON output consumed by GitHub Actions:
+
+```sh
+pnpm exec vitest run --config vitest.evals.config.ts \
+  --reporter=vitest-evals/reporter \
+  --reporter=json \
+  --outputFile.json=vitest-results.json
+```
+
+The reporter surfaces:
+
+- eval test status
+- score summaries
+- judge metadata/rationales
+- app output summaries
+- tool activity
+- separate application, judge, and total token and USD cost summaries
+- replay metadata
+- non-eval failures without pretending the run passed
+
+## Local report UI
+
+Use `vitest-evals serve` to inspect one or more Vitest JSON artifacts locally:
+
+```sh
+pnpm exec vitest-evals serve vitest-results.json
+pnpm exec vitest-evals serve "eval-results/*.json"
+pnpm exec vitest-evals serve eval-results/
+```
+
+The command accepts JSON files, simple globs, and directories. It opens a local
+report viewer for run summaries, eval cases, scores, application and judge
+usage, harness sessions, tool calls, transcripts, trace details, and raw case
+metadata. Unknown costs stay `n/a`; partial costs are not shown as totals.
+
+Use the same JSON artifacts for local investigation and GitHub reporting.
+
+## GitHub Actions reporting
+
+Public guide: https://vitest-evals.sentry.dev/docs/github
+Repo guide: https://github.com/getsentry/vitest-evals/blob/main/docs/github-actions.md
+
+Use the action, not a raw CLI command, in workflow docs:
+
+```yaml
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install
+
+      - name: Run evals
+        run: |
+          pnpm exec vitest run --config vitest.evals.config.ts \
+            --reporter=vitest-evals/reporter \
+            --reporter=json \
+            --outputFile.json=vitest-results.json
+
+      - uses: getsentry/vitest-evals@v0
+        if: always()
+        with:
+          results: vitest-results.json
+          publish-check: true
+          min-pass-rate: 0.8
+```
+
+Action inputs:
+
+- `results`: JSON result file paths or globs. Default:
+  `vitest-results.json`.
+- `publish-summary`: write a GitHub Actions job summary. Default: `true`.
+- `publish-annotations`: emit workflow annotations for failed evals. Default:
+  `true`.
+- `publish-check`: create a GitHub Check Run for the combined report. Default:
+  `false`. On `pull_request`, attaches to the PR head SHA (not the merge SHA).
+- `check-name`: Check Run name. Default: `vitest-evals`.
+- `sha`: optional commit SHA override for the Check Run.
+- `fail-on-failures`: fail the reporting step when any eval case failed.
+  Equivalent to `min-pass-rate: 1`. Default: `false`.
+- `soft-fail`: keep the step green when a published Check Run owns a failed
+  gate. Defaults to true only after a successful Check Run publish.
+- `min-pass-rate` / `min-score-average`: optional aggregate floors in `0`-`1`.
+
+The job summary and Check Run show application usage, judge usage, and their
+combined total separately. If either side has usage but no cost, the combined
+cost is omitted.
+
+Check Run SHA resolution order on `pull_request`:
+
+1. explicit `sha` input
+2. `GITHUB_PR_HEAD_SHA`
+3. `pull_request.head.sha` from `GITHUB_EVENT_PATH`
+4. `GITHUB_SHA`
+
+Ownership model:
+
+- a Check Run is separate from the workflow job row
+- with `publish-check: true` + a gate, the Check Run conclusion/title follow the
+  gate and soft-fail keeps the step green so the check owns PR status
+- if publishing is skipped or fails, the step still fails on a rejected gate
+- leave `publish-check` off for job-summary-only mode (no detached Checks API
+  entry; status stays under the real workflow job)
+
+For Check Runs, grant `checks: write`.
+
+For sharded evals, upload one JSON artifact per matrix job, optionally publish a
+per-shard job summary (`publish-check: false`), and publish one combined gate
+from a reducer job:
+
+```yaml
+# per shard
+- uses: getsentry/vitest-evals@v0
+  if: always()
+  with:
+    results: vitest-results-${{ matrix.shard }}.json
+    publish-summary: true
+    publish-check: false
+
+# reducer
+- uses: actions/download-artifact@v4
+  with:
+    pattern: vitest-evals-*
+    path: eval-results
+    merge-multiple: true
+
+- uses: getsentry/vitest-evals@v0
+  with:
+    results: eval-results/*.json
+    publish-check: true
+    min-pass-rate: 0.8
+```
+
+Recommended patterns:
+
+1. Check Run owns status (`publish-check: true` + gate + default soft-fail)
+2. Workflow job owns status (`publish-check: false` + real job name / summary)
+3. Per-shard summaries + one reducer gate
+
+## Replay
+
+Replay is for local tool calls that are useful to capture once and reuse across
+eval runs. Good candidates include web search requests, retrieval calls,
+third-party API calls, browser fetches, internal service lookups, and other
+expensive, slow, rate-limited, or unstable external dependencies. It keeps evals
+focused on agent behavior while reducing repeat cost and environmental noise.
+
+First-party harnesses support opt-in replay for tools. Configure replay with
+environment variables and mark individual tools as replayable from the harness
+or tool definition. Sanitize secrets, unstable fields, and high-cardinality data
+before committing recordings alongside evals. Keep live provider model calls
+live unless the app exposes them as local tools.
+
+Replay modes:
+
+- `off`: execute tools normally and do not record.
+- `auto`: replay existing recordings; record when missing.
+- `strict`: replay existing recordings; fail when missing.
+- `record`: execute and record.
+
+Common commands:
+
+```sh
+VITEST_EVALS_REPLAY_MODE=auto pnpm evals
+VITEST_EVALS_REPLAY_MODE=strict pnpm evals
+VITEST_EVALS_REPLAY_MODE=record pnpm evals
+```
+
+Default recording directory:
+
+```text
+.vitest-evals/recordings
+```
+
+Use replay only for deterministic or safely sanitized tool calls. Add replay
+keys and sanitizers when inputs or outputs contain unstable values, secrets, or
+high-cardinality data.
+
+## Error handling
+
+Harnesses can attach partial runs to thrown errors with
+`attachHarnessRunToError(...)`. Reporters and matchers can recover the run with
+`getHarnessRunFromError(...)`. First-party harnesses use this pattern to expose
+transcript events, usage, and partial output when execution fails.
+
+## Practical recommendations
+
+- Keep app output typed and narrow. Assert on `result.output` with ordinary
+  Vitest matchers.
+- Keep normalized run data JSON-safe.
+- Keep expected values in case rows, explicit matcher options, or judge config.
+- Prefer deterministic judges for contracts such as tool calls and structured
+  output.
+- Keep model-graded prompts and rubrics in the judge. Run provider calls through
+  `ctx.runJudge(...)` and a separate `judgeHarness`.
+- Run the app once per eval case, then judge the captured result.
+- Publish CI results with `getsentry/vitest-evals@v0`.
+- For sharded CI, emit distinct JSON artifacts per shard and combine them in
+  one reducer reporting job.
+- Put known USD cost in `usage.costUsd`. Keep provider-specific pricing details
+  in `usage.metadata`.
+
+## Quick command reference
+
+```sh
+# install core package
+pnpm add -D vitest-evals
+
+# install a harness package
+pnpm add -D @vitest-evals/harness-ai-sdk
+
+# run evals locally with terminal reporter
+pnpm evals
+
+# run evals with JSON output for GitHub reporting
+pnpm exec vitest run --config vitest.evals.config.ts \
+  --reporter=vitest-evals/reporter \
+  --reporter=json \
+  --outputFile.json=vitest-results.json
+
+# run with replay
+VITEST_EVALS_REPLAY_MODE=auto pnpm evals
+```

@@ -1,0 +1,50 @@
+{
+  "name": "@vitest-evals/github-reporter",
+  "version": "0.18.1",
+  "description": "GitHub Actions reporting internals for vitest-evals runs.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/getsentry/vitest-evals.git",
+    "directory": "packages/github-reporter"
+  },
+  "author": "David Cramer",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/getsentry/vitest-evals/issues"
+  },
+  "homepage": "https://github.com/getsentry/vitest-evals/tree/main/packages/github-reporter#readme",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "bin": {
+    "vitest-evals-github-report": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup --config ./tsup.config.ts",
+    "build:action": "tsup --config ./tsup.action.config.ts"
+  },
+  "dependencies": {
+    "@vitest-evals/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "vitest": ">=4 <6"
+  },
+  "devDependencies": {
+    "vitest": "^5.1.0"
+  }
+}

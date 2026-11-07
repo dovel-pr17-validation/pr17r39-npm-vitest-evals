@@ -1,0 +1,821 @@
+import { messagesToTranscriptEvents } from "@vitest-evals/core";
+import type { ReportWorkspace } from "@vitest-evals/core";
+import { describe, expect, test } from "vitest";
+import {
+  buildSpanTree,
+  buildTranscript,
+  caseExpected,
+  caseInput,
+  caseScoreTone,
+  caseToolCallCount,
+  caseToolCalls,
+  caseTotalTokens,
+  compactValue,
+  filterReportCases,
+  formatScore,
+  scoreTone,
+  sortReportCases,
+  summarizeWorkspace,
+} from "./model";
+
+const workspace: ReportWorkspace = {
+  schemaVersion: 2,
+  runs: [
+    {
+      id: "shard-a.json",
+      source: "shard-a.json",
+      status: "failed",
+      startedAt: 1000,
+      durationMs: 4500,
+      totals: {
+        total: 2,
+        passed: 1,
+        failed: 1,
+        skipped: 0,
+        evalTotal: 2,
+        evalPassed: 1,
+        evalFailed: 1,
+      },
+    },
+  ],
+  cases: [
+    {
+      id: "case-1",
+      runId: "shard-a.json",
+      source: "shard-a.json",
+      file: "/repo/apps/demo/evals/refund.eval.ts",
+      displayFile: "apps/demo/evals/refund.eval.ts",
+      title: "rejects fraud",
+      fullName: "refund agent rejects fraud",
+      ancestorTitles: ["refund agent"],
+      displayName: "refund agent > rejects fraud",
+      status: "failed",
+      durationMs: 42,
+      failureMessages: ["Score: 0.20 below threshold: 1.00"],
+      eval: {
+        avgScore: 0.2,
+        scores: [
+          {
+            name: "StructuredOutputJudge",
+            score: 0.2,
+            judgeRuns: [
+              {
+                output: { choice: "C" },
+                usage: { totalTokens: 100, costUsd: 0.02 },
+                session: { events: [] },
+                errors: [],
+              },
+            ],
+          },
+        ],
+      },
+      harness: {
+        name: "pi-ai",
+        run: {
+          output: { status: "denied" },
+          usage: {
+            totalTokens: 1220,
+            costUsd: 0.08,
+            toolCalls: 1,
+          },
+          session: {
+            events: messagesToTranscriptEvents([
+              {
+                role: "assistant",
+                toolCalls: [
+                  {
+                    id: "call_lookup",
+                    name: "lookupInvoice",
+                    durationMs: 6,
+                  },
+                ],
+              },
+            ]),
+          },
+          traces: [
+            {
+              id: "trace-1",
+              name: "pi-ai",
+              spans: [
+                {
+                  id: "root",
+                  traceId: "trace-1",
+                  name: "run",
+                  kind: "run",
+                  startedAt: "2026-06-03T08:00:00.000Z",
+                },
+                {
+                  id: "child",
+                  traceId: "trace-1",
+                  parentId: "root",
+                  name: "lookupInvoice",
+                  kind: "tool",
+                  startedAt: "2026-06-03T08:00:01.000Z",
+                  attributes: {
+                    "gen_ai.tool.name": "lookupInvoice",
+                    "gen_ai.tool.call.arguments": { invoiceId: "inv_123" },
+                  },
+                },
+              ],
+            },
+          ],
+          errors: [],
+        },
+      },
+    },
+    {
+      id: "case-2",
+      runId: "shard-a.json",
+      source: "shard-a.json",
+      file: "/repo/apps/demo/evals/refund.eval.ts",
+      displayFile: "apps/demo/evals/refund.eval.ts",
+      title: "approves eligible refund",
+      fullName: "refund agent approves eligible refund",
+      ancestorTitles: ["refund agent"],
+      displayName: "refund agent > approves eligible refund",
+      status: "passed",
+      durationMs: 30,
+      failureMessages: [],
+      eval: {
+        avgScore: 1,
+        scores: [{ name: "StructuredOutputJudge", score: 1 }],
+        toolCalls: [
+          {
+            name: "validateRefund",
+            status: "ok",
+          },
+        ],
+      },
+    },
+  ],
+};
+
+describe("summarizeWorkspace", () => {
+  test("aggregates score, tokens, tools, and status counts", () => {
+    expect(summarizeWorkspace(workspace)).toMatchObject({
+      runCount: 1,
+      caseCount: 2,
+      passed: 1,
+      failed: 1,
+      averageScore: 0.6,
+      appTokens: 1220,
+      judgeTokens: 100,
+      totalTokens: 1320,
+      appCostUsd: 0.08,
+      judgeCostUsd: 0.02,
+      totalCostUsd: 0.1,
+      toolCallCount: 2,
+      durationMs: 4500,
+    });
+  });
+
+  test("does not let an empty usage run hide a known sibling cost", () => {
+    const testCase = structuredClone(workspace.cases[0]!);
+    const emptyUsageCase = structuredClone(workspace.cases[0]!);
+    emptyUsageCase.id = "case-empty-usage";
+    emptyUsageCase.harness!.run!.usage = {};
+    emptyUsageCase.harness!.run!.session.events = [];
+    emptyUsageCase.eval = undefined;
+
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        cases: [testCase, emptyUsageCase],
+      }),
+    ).toMatchObject({
+      appTokens: 1220,
+      appCostUsd: 0.08,
+      totalCostUsd: 0.1,
+    });
+  });
+
+  test("treats session-only tool calls as usage with unknown cost", () => {
+    const testCase = structuredClone(workspace.cases[0]!);
+    const sessionOnlyCase = structuredClone(workspace.cases[0]!);
+    sessionOnlyCase.id = "case-session-only";
+    sessionOnlyCase.harness!.run!.usage = {};
+    sessionOnlyCase.eval = undefined;
+
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        cases: [testCase, sessionOnlyCase],
+      }),
+    ).toMatchObject({
+      appTokens: 1220,
+      appCostUsd: undefined,
+      totalCostUsd: undefined,
+    });
+  });
+
+  test("uses the wall-clock envelope for parallel runs", () => {
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        runs: [
+          {
+            ...workspace.runs[0]!,
+            durationMs: 5000,
+            id: "shard-a.json",
+            source: "shard-a.json",
+            startedAt: 1000,
+          },
+          {
+            ...workspace.runs[0]!,
+            durationMs: 3000,
+            id: "shard-b.json",
+            source: "shard-b.json",
+            startedAt: 2000,
+          },
+        ],
+      }).durationMs,
+    ).toBe(5000);
+  });
+
+  test("uses known wall-clock intervals when some runs lack start times", () => {
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        runs: [
+          {
+            ...workspace.runs[0]!,
+            durationMs: 5000,
+            id: "shard-a.json",
+            source: "shard-a.json",
+            startedAt: 1000,
+          },
+          {
+            ...workspace.runs[0]!,
+            durationMs: 3000,
+            id: "shard-b.json",
+            source: "shard-b.json",
+          },
+        ],
+      }).durationMs,
+    ).toBe(5000);
+  });
+
+  test("falls back to summed durations for runs without start times", () => {
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        runs: [
+          {
+            id: "shard-a.json",
+            source: "shard-a.json",
+            status: "failed",
+            durationMs: 5000,
+            totals: workspace.runs[0]!.totals,
+          },
+          {
+            id: "shard-b.json",
+            source: "shard-b.json",
+            status: "failed",
+            durationMs: 3000,
+            totals: workspace.runs[0]!.totals,
+          },
+        ],
+      }).durationMs,
+    ).toBe(8000);
+  });
+
+  test("keeps runtime unknown when no runs have durations", () => {
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        runs: [
+          {
+            id: "shard-a.json",
+            source: "shard-a.json",
+            status: "failed",
+            totals: workspace.runs[0]!.totals,
+          },
+        ],
+      }).durationMs,
+    ).toBeUndefined();
+  });
+});
+
+describe("sortReportCases", () => {
+  test("defaults to failed cases first when no sort column is set", () => {
+    expect(
+      sortReportCases(
+        [workspace.cases[1]!, workspace.cases[0]!],
+        undefined,
+        "asc",
+      ).map((testCase) => testCase.status),
+    ).toEqual(["failed", "passed"]);
+  });
+
+  test("orders failed cases first when sorting by status", () => {
+    expect(
+      sortReportCases(workspace.cases, "status", "asc").map(
+        (testCase) => testCase.status,
+      ),
+    ).toEqual(["failed", "passed"]);
+  });
+
+  test("orders higher scores first when sorting score descending", () => {
+    expect(
+      sortReportCases(workspace.cases, "score", "desc").map(
+        (testCase) => testCase.eval?.avgScore,
+      ),
+    ).toEqual([1, 0.2]);
+  });
+
+  test("keeps cases without a value last in both directions", () => {
+    const unscored = {
+      ...workspace.cases[0]!,
+      id: "unscored",
+      eval: undefined,
+    };
+    for (const direction of ["asc", "desc"] as const) {
+      const sorted = sortReportCases(
+        [unscored, ...workspace.cases],
+        "score",
+        direction,
+      );
+      expect(sorted[sorted.length - 1]?.id).toBe("unscored");
+    }
+  });
+
+  test("orders models alphabetically", () => {
+    expect(
+      sortReportCases(
+        [
+          {
+            ...workspace.cases[0]!,
+            harness: {
+              name: "pi-ai",
+              run: {
+                errors: [],
+                output: {},
+                session: { events: [] },
+                usage: { model: "gpt-4o" },
+              },
+            },
+          },
+          {
+            ...workspace.cases[1]!,
+            harness: {
+              name: "pi-ai",
+              run: {
+                errors: [],
+                output: {},
+                session: { events: [] },
+                usage: { model: "gemini-2.5-flash" },
+              },
+            },
+          },
+        ],
+        "model",
+        "asc",
+      ).map((testCase) => testCase.harness?.run?.usage?.model),
+    ).toEqual(["gemini-2.5-flash", "gpt-4o"]);
+  });
+});
+
+describe("filterReportCases", () => {
+  test("filters by status, run, and search query", () => {
+    expect(
+      filterReportCases(workspace.cases, {
+        status: "failed",
+        runId: "shard-a.json",
+        model: "all",
+        query: "fraud",
+      }),
+    ).toEqual([workspace.cases[0]]);
+  });
+
+  test("searches visible judge names but not hidden harness names", () => {
+    expect(
+      filterReportCases(workspace.cases, {
+        status: "all",
+        runId: "all",
+        model: "all",
+        query: "StructuredOutputJudge",
+      }),
+    ).toEqual(workspace.cases);
+
+    expect(
+      filterReportCases(workspace.cases, {
+        status: "all",
+        runId: "all",
+        model: "all",
+        query: "pi-ai",
+      }),
+    ).toEqual([]);
+  });
+
+  test("searches recorded model ids", () => {
+    expect(
+      filterReportCases(
+        [
+          {
+            ...workspace.cases[0]!,
+            harness: {
+              name: "pi-ai",
+              run: {
+                errors: [],
+                output: {},
+                session: { events: [] },
+                usage: { model: "gemini-2.5-flash" },
+              },
+            },
+          },
+        ],
+        {
+          status: "all",
+          runId: "all",
+          model: "all",
+          query: "gemini-2.5",
+        },
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("filters by recorded model id", () => {
+    expect(
+      filterReportCases(
+        [
+          {
+            ...workspace.cases[0]!,
+            harness: {
+              name: "pi-ai",
+              run: {
+                errors: [],
+                output: {},
+                session: { events: [] },
+                usage: { model: "gemini-2.5-flash" },
+              },
+            },
+          },
+          workspace.cases[1]!,
+        ],
+        {
+          status: "all",
+          runId: "all",
+          model: "gemini-2.5-flash",
+          query: "",
+        },
+      ),
+    ).toHaveLength(1);
+  });
+});
+
+describe("case helpers", () => {
+  test("returns captured tool calls and trace trees", () => {
+    expect(caseToolCalls(workspace.cases[0]!)).toHaveLength(1);
+    expect(caseToolCalls(workspace.cases[1]!)).toEqual([
+      {
+        name: "validateRefund",
+        status: "ok",
+      },
+    ]);
+    expect(caseTotalTokens(workspace.cases[0]!)).toBe(1220);
+    expect(caseToolCallCount(workspace.cases[0]!)).toBe(1);
+    expect(caseToolCallCount(workspace.cases[1]!)).toBe(1);
+    expect(
+      buildSpanTree(workspace.cases[0]!.harness?.run?.traces?.[0]?.spans ?? []),
+    ).toMatchObject([
+      {
+        id: "root",
+        nodeId: "root",
+        children: [{ id: "child" }],
+      },
+    ]);
+    expect(
+      buildTranscript(workspace.cases[0]!.harness!.run!).events.find(
+        (event) => event.kind === "tool",
+      ),
+    ).toMatchObject({
+      durationMs: 6,
+      kind: "tool",
+      name: "lookupInvoice",
+      status: "pending",
+    });
+  });
+
+  test("joins session tool result events into transcript tool events by id", () => {
+    const testCase = structuredClone(workspace.cases[0]!);
+    const run = testCase.harness!.run!;
+    run.traces = [];
+    run.session.events.push({
+      type: "tool_call",
+      id: "call_lookup_join",
+      name: "lookupInvoice",
+      arguments: { invoiceId: "inv_123" },
+      durationMs: 6,
+    });
+    run.session.events.push({
+      type: "tool_result",
+      toolCallId: "call_lookup_join",
+      name: "lookupInvoice",
+      content: { refundable: false },
+      durationMs: 8,
+    });
+
+    expect(
+      buildTranscript(run).events.find(
+        (event) => event.kind === "tool" && event.callId === "call_lookup_join",
+      ),
+    ).toMatchObject({
+      arguments: { invoiceId: "inv_123" },
+      durationMs: 8,
+      kind: "tool",
+      name: "lookupInvoice",
+      result: { refundable: false },
+      status: "ok",
+    });
+  });
+
+  test("renders unmatched tool result errors as transcript tool events", () => {
+    const transcript = buildTranscript({
+      errors: [],
+      session: {
+        events: messagesToTranscriptEvents([
+          {
+            role: "tool",
+            toolCallId: "call_timeout",
+            name: "lookupInvoice",
+            error: { message: "Tool timed out", type: "TimeoutError" },
+          },
+        ]),
+      },
+      usage: {},
+    });
+
+    expect(transcript.events).toEqual([
+      {
+        callId: "call_timeout",
+        error: { message: "Tool timed out", type: "TimeoutError" },
+        id: "event-0:tool-result",
+        kind: "tool",
+        name: "lookupInvoice",
+        status: "error",
+      },
+    ]);
+  });
+
+  test("does not let usage undercount recorded session tool calls", () => {
+    const testCase = structuredClone(workspace.cases[0]!);
+    testCase.harness!.run!.usage.toolCalls = 1;
+    testCase.harness!.run!.session.events.push({
+      type: "tool_call",
+      id: "call_create",
+      name: "createRefund",
+    });
+
+    expect(caseToolCallCount(testCase)).toBe(2);
+    expect(
+      summarizeWorkspace({
+        ...workspace,
+        cases: [testCase],
+      }).toolCallCount,
+    ).toBe(2);
+  });
+
+  test("formats scores for compact UI surfaces", () => {
+    expect(formatScore(0.2)).toBe("20%");
+    expect(scoreTone(1)).toBe("good");
+    expect(scoreTone(0.7)).toBe("warn");
+    expect(scoreTone(0.2)).toBe("bad");
+    expect(
+      caseScoreTone({
+        ancestorTitles: [],
+        displayFile: "a.ts",
+        displayName: "fail",
+        failureMessages: [],
+        file: "/a.ts",
+        fullName: "fail",
+        id: "fail",
+        runId: "run",
+        status: "failed",
+        title: "fail",
+        eval: { avgScore: 0.75, scores: [] },
+      }),
+    ).toBe("bad");
+    expect(
+      caseScoreTone({
+        ancestorTitles: [],
+        displayFile: "a.ts",
+        displayName: "pass",
+        failureMessages: [],
+        file: "/a.ts",
+        fullName: "pass",
+        id: "pass",
+        runId: "run",
+        status: "passed",
+        title: "pass",
+        eval: { avgScore: 0.75, scores: [] },
+      }),
+    ).toBe("good");
+  });
+
+  test("builds transcripts from session events, not traces", () => {
+    const transcript = buildTranscript({
+      errors: [],
+      session: {
+        events: messagesToTranscriptEvents([
+          { role: "user", content: "Refund invoice inv_123" },
+          { role: "assistant", content: "Checking the invoice." },
+        ]),
+      },
+      usage: {},
+      traces: [
+        {
+          spans: [
+            {
+              id: "model-1",
+              kind: "model",
+              name: "model",
+              startedAt: "2026-06-03T08:00:00.000Z",
+              attributes: {
+                "gen_ai.input.messages": [{ role: "user", content: "ignored" }],
+                "gen_ai.output.messages": [
+                  { role: "assistant", content: "also ignored" },
+                ],
+              },
+            },
+            {
+              id: "model-2",
+              kind: "model",
+              name: "model",
+              startedAt: "2026-06-03T08:00:01.000Z",
+              attributes: {
+                "gen_ai.input.messages": [
+                  { role: "user", content: "ignored" },
+                  { role: "assistant", content: "also ignored" },
+                  { role: "user", content: "ignored again" },
+                ],
+                "gen_ai.output.messages": [
+                  { role: "assistant", content: "ignored done" },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(
+      transcript.events
+        .filter((event) => event.kind === "message")
+        .map((event) => [event.role, event.content]),
+    ).toEqual([
+      ["user", "Refund invoice inv_123"],
+      ["assistant", "Checking the invoice."],
+    ]);
+  });
+
+  test("keeps trace spans separate from transcript events", () => {
+    const spans = [
+      {
+        durationMs: 120,
+        id: "model-1",
+        kind: "model" as const,
+        name: "model",
+      },
+      {
+        durationMs: 4,
+        id: "tool-1",
+        kind: "tool" as const,
+        name: "lookupInvoice",
+      },
+    ];
+    const transcript = buildTranscript({
+      errors: [],
+      session: { events: messagesToTranscriptEvents([]) },
+      usage: {},
+      traces: [
+        {
+          spans,
+        },
+      ],
+    });
+
+    expect(transcript.events).toEqual([]);
+    expect(buildSpanTree(spans)).toMatchObject([
+      { id: "tool-1" },
+      { id: "model-1" },
+    ]);
+  });
+
+  test("keeps session tool results when traces provide their own events", () => {
+    const transcript = buildTranscript({
+      errors: [],
+      session: {
+        events: messagesToTranscriptEvents([
+          {
+            role: "assistant",
+            toolCalls: [
+              {
+                id: "call_lookup",
+                name: "lookupInvoice",
+                arguments: { invoiceId: "inv_123" },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            toolCallId: "call_lookup",
+            name: "lookupInvoice",
+            content: { refundable: true },
+            durationMs: 7,
+          },
+        ]),
+      },
+      usage: {},
+      traces: [
+        {
+          spans: [
+            {
+              id: "model-1",
+              kind: "model",
+              name: "model",
+              attributes: {
+                "gen_ai.input.messages": [
+                  { role: "user", content: "Refund invoice inv_123" },
+                ],
+                "gen_ai.output.messages": [
+                  { role: "assistant", content: "Checking the invoice." },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(
+      transcript.events.map((event) =>
+        event.kind === "message"
+          ? [event.kind, event.role, event.content]
+          : [event.kind, event.name, event.status, event.result],
+      ),
+    ).toEqual([["tool", "lookupInvoice", "ok", { refundable: true }]]);
+  });
+
+  test("ignores sparse trace tool events in transcript", () => {
+    const transcript = buildTranscript({
+      errors: [],
+      session: {
+        events: messagesToTranscriptEvents([
+          { role: "user", content: "Refund invoice inv_123" },
+          { role: "assistant", content: "Approved" },
+        ]),
+      },
+      usage: {},
+      traces: [
+        {
+          spans: [
+            {
+              id: "tool-1",
+              kind: "tool",
+              name: "lookupInvoice",
+              attributes: {
+                "gen_ai.tool.name": "lookupInvoice",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(
+      transcript.events.map((event) =>
+        event.kind === "message"
+          ? [event.kind, event.role, event.content]
+          : [event.kind, event.name],
+      ),
+    ).toEqual([
+      ["message", "user", "Refund invoice inv_123"],
+      ["message", "assistant", "Approved"],
+    ]);
+  });
+});
+
+describe("caseInput and caseExpected", () => {
+  test("reads recorded eval fields and falls back to transcript or judge metadata", () => {
+    expect(
+      caseInput({
+        ...workspace.cases[0]!,
+        eval: { avgScore: 1, input: "recorded input", scores: [] },
+      }),
+    ).toBe("recorded input");
+
+    expect(
+      caseExpected({
+        ...workspace.cases[0]!,
+        eval: {
+          avgScore: 1,
+          scores: [
+            { name: "judge", score: 1, metadata: { expected: "Paris" } },
+          ],
+        },
+      }),
+    ).toBe("Paris");
+
+    expect(compactValue({ status: "approved" })).toBe('{"status":"approved"}');
+  });
+});

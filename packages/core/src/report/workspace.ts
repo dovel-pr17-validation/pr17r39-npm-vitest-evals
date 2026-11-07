@@ -1,0 +1,298 @@
+import { z } from "zod";
+import { FiniteNumberSchema, isRecord, parseWithSchema } from "../schema-utils";
+import {
+  EvalMetaSchema,
+  HarnessMetaSchema,
+  readEvalTaskMeta,
+} from "./metadata";
+import {
+  type VitestJsonAssertion,
+  VitestJsonLocationSchema,
+  type VitestJsonReport,
+  parseVitestJsonReport,
+} from "./vitest-json";
+import { VitestJsonStatusSchema } from "./vitest-json";
+
+/** Current schema version for collected report workspaces. */
+export const REPORT_WORKSPACE_SCHEMA_VERSION = 2;
+
+/** One collected Vitest JSON report source in a multi-run workspace. */
+export const ReportRunSchema = z
+  .object({
+    id: z.string(),
+    source: z.string().optional(),
+    status: z.enum(["passed", "failed"]),
+    startedAt: FiniteNumberSchema.optional(),
+    durationMs: FiniteNumberSchema.optional(),
+    totals: z.object({
+      total: FiniteNumberSchema,
+      passed: FiniteNumberSchema,
+      failed: FiniteNumberSchema,
+      skipped: FiniteNumberSchema,
+      evalTotal: FiniteNumberSchema,
+      evalPassed: FiniteNumberSchema,
+      evalFailed: FiniteNumberSchema,
+    }),
+  })
+  .strict();
+
+/** One collected Vitest JSON report source in a multi-run workspace. */
+export type ReportRun = z.infer<typeof ReportRunSchema>;
+
+/** One eval or harness-backed test case collected from Vitest JSON. */
+export const ReportCaseSchema = z
+  .object({
+    id: z.string(),
+    runId: z.string(),
+    source: z.string().optional(),
+    file: z.string(),
+    displayFile: z.string(),
+    title: z.string(),
+    fullName: z.string(),
+    ancestorTitles: z.array(z.string()),
+    tags: z.array(z.string()).optional(),
+    displayName: z.string(),
+    status: VitestJsonStatusSchema,
+    durationMs: FiniteNumberSchema.optional(),
+    location: VitestJsonLocationSchema.optional(),
+    failureMessages: z.array(z.string()).default([]),
+    eval: EvalMetaSchema.optional(),
+    harness: HarnessMetaSchema.optional(),
+  })
+  .strict();
+
+/** One eval or harness-backed test case collected from Vitest JSON. */
+export type ReportCase = z.infer<typeof ReportCaseSchema>;
+
+const reportWorkspaceShape = {
+  runs: z.array(ReportRunSchema),
+  cases: z.array(ReportCaseSchema),
+};
+
+const LegacyReportWorkspaceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    ...reportWorkspaceShape,
+  })
+  .strict();
+
+/** Full multi-run report workspace consumed by rich report UIs. */
+export const ReportWorkspaceSchema = z
+  .object({
+    schemaVersion: z.literal(REPORT_WORKSPACE_SCHEMA_VERSION),
+    ...reportWorkspaceShape,
+  })
+  .strict();
+
+/** Full multi-run report workspace consumed by rich report UIs. */
+export type ReportWorkspace = z.infer<typeof ReportWorkspaceSchema>;
+
+/** Input accepted when collecting one Vitest JSON report into a workspace. */
+export type ReportWorkspaceInput =
+  | VitestJsonReport
+  | {
+      report: VitestJsonReport;
+      source?: string;
+    };
+
+/** Options for collecting one or more Vitest JSON reports. */
+export type CollectReportWorkspaceOptions = {
+  /** Workspace prefix used to render source files as relative paths. */
+  workspace?: string;
+};
+
+/** Parses and validates an unknown value as a collected report workspace. */
+export function parseReportWorkspace(input: unknown): ReportWorkspace {
+  if (isRecord(input) && input.schemaVersion === 1) {
+    const legacy = parseWithSchema(
+      LegacyReportWorkspaceSchema,
+      input,
+      "report workspace",
+    );
+    return {
+      ...legacy,
+      schemaVersion: REPORT_WORKSPACE_SCHEMA_VERSION,
+    };
+  }
+
+  return parseWithSchema(ReportWorkspaceSchema, input, "report workspace");
+}
+
+/** Collects eval and harness metadata from one or more Vitest JSON reports. */
+export function collectReportWorkspace(
+  input: ReportWorkspaceInput | ReportWorkspaceInput[],
+  options: CollectReportWorkspaceOptions = {},
+): ReportWorkspace {
+  const entries = Array.isArray(input) ? input : [input];
+  const runs: ReportRun[] = [];
+  const cases: ReportCase[] = [];
+
+  entries.forEach((entry, index) => {
+    const { report, source } = normalizeWorkspaceInput(entry);
+    const runId = source ?? `run-${index + 1}`;
+    const runCases: ReportCase[] = [];
+
+    for (const file of report.testResults) {
+      for (const assertion of file.assertionResults) {
+        const meta = readEvalTaskMeta(assertion.meta);
+        if (!meta) {
+          continue;
+        }
+
+        const evalMeta =
+          meta.eval ??
+          (meta.harness
+            ? {
+                avgScore:
+                  assertion.status === "passed"
+                    ? 1
+                    : assertion.status === "failed"
+                      ? 0
+                      : null,
+                scores: [],
+                thresholdFailed: false,
+              }
+            : undefined);
+
+        runCases.push({
+          id: createCaseId(runId, file.name, assertion),
+          runId,
+          ...(source ? { source } : {}),
+          file: file.name,
+          displayFile: normalizeReportPath(file.name, options.workspace),
+          title: assertion.title,
+          fullName: assertion.fullName,
+          ancestorTitles: assertion.ancestorTitles,
+          ...(assertion.tags ? { tags: assertion.tags } : {}),
+          displayName: formatDisplayName(assertion),
+          status: assertion.status,
+          ...(typeof assertion.duration === "number"
+            ? { durationMs: assertion.duration }
+            : {}),
+          ...(assertion.location ? { location: assertion.location } : {}),
+          failureMessages: assertion.failureMessages ?? [],
+          ...(evalMeta ? { eval: evalMeta } : {}),
+          ...(meta.harness ? { harness: meta.harness } : {}),
+        });
+      }
+    }
+
+    runs.push({
+      id: runId,
+      ...(source ? { source } : {}),
+      status:
+        report.success &&
+        runCases.every((testCase) => testCase.status !== "failed")
+          ? "passed"
+          : "failed",
+      startedAt: report.startTime,
+      durationMs: resolveRunDuration(report),
+      totals: {
+        total: report.numTotalTests,
+        passed: report.numPassedTests,
+        failed: report.numFailedTests,
+        skipped: report.numPendingTests + report.numTodoTests,
+        evalTotal: runCases.length,
+        evalPassed: runCases.filter((testCase) => testCase.status === "passed")
+          .length,
+        evalFailed: runCases.filter((testCase) => testCase.status === "failed")
+          .length,
+      },
+    });
+    cases.push(...runCases);
+  });
+
+  return {
+    schemaVersion: REPORT_WORKSPACE_SCHEMA_VERSION,
+    runs,
+    cases,
+  };
+}
+
+function normalizeWorkspaceInput(input: ReportWorkspaceInput) {
+  if (isVitestJsonReportLike(input)) {
+    return {
+      report: parseVitestJsonReport(input),
+    };
+  }
+
+  if (isRecord(input) && "report" in input) {
+    return {
+      report: parseVitestJsonReport(input.report),
+      source: typeof input.source === "string" ? input.source : undefined,
+    };
+  }
+
+  return {
+    report: parseVitestJsonReport(input),
+  };
+}
+
+function isVitestJsonReportLike(input: unknown) {
+  return isRecord(input) && Array.isArray(input.testResults);
+}
+
+function createCaseId(
+  runId: string,
+  file: string,
+  assertion: VitestJsonAssertion,
+) {
+  return [runId, file, assertion.location?.line ?? 0, assertion.fullName].join(
+    ":",
+  );
+}
+
+function formatDisplayName(assertion: VitestJsonAssertion) {
+  return [...assertion.ancestorTitles, assertion.title]
+    .filter((part) => part.length > 0)
+    .join(" > ");
+}
+
+function resolveRunDuration(report: VitestJsonReport) {
+  const intervals = report.testResults
+    .map((file) => {
+      const start = file.startTime;
+      const end = file.endTime;
+      if (!isFiniteNumber(start) || !isFiniteNumber(end) || end < start) {
+        return undefined;
+      }
+
+      return {
+        start,
+        end,
+      };
+    })
+    .filter((interval): interval is { start: number; end: number } =>
+      Boolean(interval),
+    );
+
+  if (intervals.length === 0) {
+    return undefined;
+  }
+
+  return (
+    Math.max(...intervals.map((interval) => interval.end)) -
+    Math.min(...intervals.map((interval) => interval.start))
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizeReportPath(path: string, workspace?: string) {
+  const normalized = path.replace(/\\/g, "/");
+  if (!workspace) {
+    return normalized;
+  }
+
+  const workspacePath = workspace.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (
+    normalized !== workspacePath &&
+    !normalized.startsWith(`${workspacePath}/`)
+  ) {
+    return normalized;
+  }
+
+  return normalized.slice(workspacePath.length).replace(/^\/+/, "");
+}

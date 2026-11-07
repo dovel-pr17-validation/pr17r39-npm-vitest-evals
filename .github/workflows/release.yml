@@ -1,0 +1,71 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump type (ignored when version is set). auto picks it from the commits; pre cuts a prerelease of that version.
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - pre
+          - patch
+          - minor
+          - major
+      version:
+        description: Exact version override (for example, 0.19.0 or 0.19.0-beta.0)
+        required: false
+        type: string
+      force:
+        description: Force release (bypass blockers)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Craft writes AI changelog summaries with the workflow token.
+  copilot-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    name: Release a new version
+    steps:
+    - name: Get auth token
+      id: token
+      uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+      with:
+        app-id: ${{ vars.SENTRY_RELEASE_BOT_CLIENT_ID }}
+        private-key: ${{ secrets.SENTRY_RELEASE_BOT_PRIVATE_KEY }}
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      with:
+        token: ${{ steps.token.outputs.token }}
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Check release baseline
+      if: inputs.version == ''
+      run: sh scripts/check-release-baseline.sh
+
+    - name: Setup Node.js
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: "24"
+
+    - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda
+      name: Install pnpm
+      with:
+        version: 10.33.0
+        run_install: false
+
+    - name: Prepare release
+      uses: getsentry/craft@v3
+      env:
+        GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+      with:
+        version: ${{ inputs.version || inputs.bump }}
+        force: ${{ inputs.force }}
+        llm_api_key: ${{ github.token }}

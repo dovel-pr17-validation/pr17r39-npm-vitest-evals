@@ -1,0 +1,124 @@
+---
+import Base from "../layouts/Base.astro";
+import ReportPreview from "../components/ReportPreview.astro";
+import Terminal from "../components/Terminal.astro";
+import { PACKAGE_VERSION, VITEST_EVALS_ACTION } from "../utils/version";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+const evalExample = `import { expect } from "vitest";
+import { createJudge, describeEval } from "vitest-evals";
+import { qaHarness } from "./qaHarness";
+
+const CapitalJudge = createJudge<string, string>(
+  "CapitalJudge",
+  async ({ output }) => ({
+    score: output.toLowerCase().includes("paris") ? 1 : 0,
+  }),
+);
+
+describeEval("capital questions", { harness: qaHarness }, (it) => {
+  it("knows the capital of France", async ({ run }) => {
+    const result = await run("What is the capital of France?");
+
+    expect(result.output).toContain("Paris");
+    await expect(result).toSatisfyJudge(CapitalJudge);
+  });
+});`;
+
+const actionExample = `- name: Run evals
+  run: |
+    pnpm exec vitest run --config vitest.evals.config.ts \\
+      --reporter=vitest-evals/reporter \\
+      --reporter=json \\
+      --outputFile.json=vitest-results.json
+
+- uses: ${VITEST_EVALS_ACTION}
+  if: always()
+  with:
+    results: vitest-results.json`;
+---
+
+<Base title="Home">
+  <section class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Current package: {PACKAGE_VERSION}</p>
+      <h1>AI evals that feel like Vitest.</h1>
+      <p>
+        Pick the harness for your runtime, run your real agent or app once, and
+        score the normalized result with ordinary Vitest assertions and judges.
+      </p>
+      <div class="hero-actions">
+        <a href={`${base}/docs`} class="btn btn-primary">Getting Started</a>
+        <a href={`${base}/api`} class="btn">API Reference</a>
+      </div>
+    </div>
+    <ReportPreview />
+  </section>
+
+  <section class="section">
+    <h2>Choose a Harness</h2>
+    <p>
+      Start with the adapter that matches the code you already run in
+      production. Each harness page uses the same Paris example so the runtime
+      differences are easy to compare.
+    </p>
+    <div class="grid two">
+      <a class="card card-link" href={`${base}/docs/harnesses/ai-sdk/`}>
+        <h3>AI SDK</h3>
+        <p>For apps built around <code>generateText</code>, <code>streamText</code>, or an AI SDK wrapper.</p>
+      </a>
+      <a class="card card-link" href={`${base}/docs/harnesses/openai-agents/`}>
+        <h3>OpenAI Agents</h3>
+        <p>For apps that own an <code>Agent</code> and run it with a <code>Runner</code>.</p>
+      </a>
+      <a class="card card-link" href={`${base}/docs/harnesses/pi-ai/`}>
+        <h3>Pi</h3>
+        <p>For Pi agents, toolsets, or runtime-compatible entrypoints.</p>
+      </a>
+      <a class="card card-link" href={`${base}/docs/harnesses/custom/`}>
+        <h3>Custom Harnesses</h3>
+        <p>For workflows, service functions, CLIs, RAG pipelines, and custom agents.</p>
+      </a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>The Core Loop</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Shape the app</h3>
+        <p>
+          Keep the production agent, service, or workflow in app code.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Configure a harness</h3>
+        <p>
+          The harness calls that app and normalizes output, session, usage, and
+          artifacts.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Judge the same run</h3>
+        <p>
+          Built-in and custom judges read output, session, tool calls, usage,
+          and run context without re-running the app.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Example</h2>
+    <Terminal title="capital.eval.ts" code={evalExample} lang="ts" />
+  </section>
+
+  <section class="section">
+    <h2>GitHub Actions</h2>
+    <p>
+      The action reads Vitest JSON reports and publishes summaries, workflow
+      annotations, and optional Check Runs.
+    </p>
+    <Terminal title=".github/workflows/evals.yml" code={actionExample} lang="yaml" />
+  </section>
+</Base>

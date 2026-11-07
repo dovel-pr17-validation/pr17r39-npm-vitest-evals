@@ -1,0 +1,68 @@
+import { expect } from "vitest";
+import { piAiHarness } from "@vitest-evals/harness-pi-ai";
+import { describeEval, StructuredOutputJudge } from "vitest-evals";
+import { createRefundAgent, type RefundCase } from "../src/refundAgent";
+
+type AssertionRefundCase = RefundCase;
+type ScoredRefundCase = Omit<RefundCase, "expected">;
+
+const skipUnlessRunningFailureExamples = () =>
+  !process.env.ANTHROPIC_API_KEY || process.env.VITEST_EVALS_FAIL_MODE !== "1";
+
+const harness = piAiHarness({
+  agent: () => createRefundAgent(),
+  toolReplay: {
+    lookupInvoice: true,
+  },
+});
+
+describeEval(
+  "demo pi refund scorer failing example",
+  {
+    skipIf: skipUnlessRunningFailureExamples,
+    harness,
+    judges: [StructuredOutputJudge({ expected: { status: "approved" } })],
+  },
+  (it) => {
+    it.for<ScoredRefundCase>([
+      {
+        name: "judge expects approval for a denied invoice",
+        input: "Refund invoice inv_404",
+        expectedStatus: "denied",
+        expectedTools: ["lookupInvoice"],
+      },
+    ])("$name", async ({ input }, { run }) => {
+      await run(input);
+    });
+  },
+);
+
+describeEval(
+  "demo pi refund assertion failing example",
+  {
+    skipIf: skipUnlessRunningFailureExamples,
+    harness,
+  },
+  (it) => {
+    it.for<AssertionRefundCase>([
+      {
+        name: "throws after the agent handles a missing invoice",
+        input: "Refund invoice inv_missing",
+        expectedStatus: "denied",
+        expectedTools: ["lookupInvoice"],
+      },
+    ])("$name", async ({ input }, { run }) => {
+      const result = await run(input);
+
+      expect(result.output).toMatchObject({
+        status: "denied",
+        invoiceId: "inv_missing",
+        reason: "Invoice inv_missing not found",
+      });
+
+      throw new Error(
+        "Intentional demo eval error after the agent handled a tool failure.",
+      );
+    });
+  },
+);

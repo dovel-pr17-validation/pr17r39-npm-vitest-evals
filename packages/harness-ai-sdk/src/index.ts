@@ -1,0 +1,1703 @@
+import {
+  attachHarnessRunToError,
+  createFailedHarnessRun,
+  createGenAiUsageAttributes,
+  ensureRunTrace,
+  getHarnessRunFromError,
+  hasCallableMethod,
+  isHarnessRun,
+  isNormalizedSession,
+  normalizeContent,
+  normalizeMetadata,
+  normalizeRecord,
+  resolveHarnessRunErrors,
+  serializeError,
+  normalizeSpanAttributes,
+  normalizeSpanError,
+  toJsonValue,
+} from "vitest-evals/harness";
+import type {
+  Harness,
+  HarnessContext,
+  HarnessRun,
+  JsonValue,
+  TranscriptToolCallEvent,
+  TranscriptEvent,
+  NormalizedSpan,
+  NormalizedSession,
+  NormalizedTrace,
+  TimingSummary,
+  UsageSummary,
+} from "vitest-evals/harness";
+import { generateObject, generateText, jsonSchema } from "ai";
+import {
+  createJudgeHarness,
+  type JudgeHarnessInput,
+} from "vitest-evals/judges";
+import {
+  executeWithReplay,
+  getReplayMetadataFromError,
+  normalizeReplayMetadata,
+} from "vitest-evals/replay";
+import type {
+  ReplayMetadata,
+  ReplayMode,
+  ToolRecording,
+  ToolReplayConfig,
+} from "vitest-evals/replay";
+import type {
+  InferToolInput,
+  InferToolOutput,
+  LanguageModel,
+  LanguageModelUsage,
+  StepResult,
+  Tool,
+  ToolExecuteFunction,
+  ToolExecutionOptions,
+  ToolSet,
+} from "ai";
+
+type MaybePromise<T> = T | Promise<T>;
+type AiSdkProviderOptions = Parameters<
+  typeof generateText
+>[0]["providerOptions"];
+type JsonOutput<TValue> = [TValue] extends [JsonValue | undefined]
+  ? TValue
+  : undefined;
+type ResultFieldOutput<
+  TResult,
+  TKey extends string,
+> = TKey extends keyof TResult
+  ? Record<string, never> extends Pick<TResult, TKey>
+    ? JsonOutput<TResult[TKey]> | undefined
+    : JsonOutput<TResult[TKey]>
+  : undefined;
+type AgentSource<TAgent, TInput = string> =
+  | TAgent
+  | ((args: AiSdkCreateAgentArgs<TInput>) => MaybePromise<TAgent>);
+type AnyAiSdkToolset<TInput = string> = Record<
+  string,
+  AiSdkToolDefinition<any, any, TInput>
+>;
+
+let nextTraceId = 0;
+
+/**
+ * Configuration for adapting an AI SDK language model into a judge harness.
+ *
+ * @example
+ * ```ts
+ * import { anthropic } from "@ai-sdk/anthropic";
+ * import { aiSdkJudgeHarness } from "@vitest-evals/harness-ai-sdk";
+ *
+ * const judgeHarness = aiSdkJudgeHarness({
+ *   model: anthropic("claude-sonnet-4-5"),
+ *   temperature: 0,
+ * });
+ * ```
+ */
+export interface AiSdkJudgeHarnessConfig {
+  /** AI SDK language model used for judge prompts. */
+  model: LanguageModel;
+  /** Optional display name for diagnostics. */
+  name?: string;
+  /** Optional judge-model temperature. */
+  temperature?: number;
+  /** Optional judge-model token cap. */
+  maxOutputTokens?: number;
+  /** Optional provider-specific options forwarded to the AI SDK. */
+  providerOptions?: AiSdkProviderOptions;
+}
+
+/**
+ * Adapts an AI SDK language model into the provider-neutral judge harness API.
+ *
+ * @example
+ * ```ts
+ * import { anthropic } from "@ai-sdk/anthropic";
+ * import { aiSdkJudgeHarness } from "@vitest-evals/harness-ai-sdk";
+ * import { describeEval, FactualityJudge } from "vitest-evals";
+ *
+ * const judgeHarness = aiSdkJudgeHarness({
+ *   model: anthropic("claude-sonnet-4-5"),
+ *   temperature: 0,
+ * });
+ *
+ * describeEval("qa agent", {
+ *   harness: qaHarness,
+ *   judgeHarness,
+ *   judges: [FactualityJudge()],
+ * }, (it) => {});
+ * ```
+ */
+export function aiSdkJudgeHarness(config: AiSdkJudgeHarnessConfig) {
+  return createJudgeHarness({
+    name: config.name ?? "ai-sdk",
+    run: (input, options) => runAiSdkJudgeHarness(config, input, options),
+  });
+}
+
+async function runAiSdkJudgeHarness(
+  config: AiSdkJudgeHarnessConfig,
+  input: JudgeHarnessInput,
+  options: { signal?: AbortSignal },
+) {
+  const system = formatAiSdkJudgeSystemPrompt(
+    input.system,
+    input.responseFormat,
+  );
+  const requestOptions = {
+    model: config.model,
+    prompt: input.prompt,
+    ...(system !== undefined ? { system } : {}),
+    ...(config.temperature !== undefined
+      ? { temperature: config.temperature }
+      : {}),
+    ...(config.maxOutputTokens !== undefined
+      ? { maxOutputTokens: config.maxOutputTokens }
+      : {}),
+    ...(config.providerOptions !== undefined
+      ? { providerOptions: config.providerOptions }
+      : {}),
+    ...(options.signal ? { abortSignal: options.signal } : {}),
+  };
+
+  if (
+    input.responseFormat?.type === "json" &&
+    input.responseFormat.schema !== undefined
+  ) {
+    const result = await generateObject({
+      ...requestOptions,
+      schema: jsonSchema(
+        input.responseFormat.schema as Parameters<typeof jsonSchema>[0],
+      ),
+    });
+
+    return createAiSdkJudgeRun(input, result, normalizeContent(result.object));
+  }
+
+  const result = await generateText(requestOptions);
+  return createAiSdkJudgeRun(input, result, result.text);
+}
+
+function createAiSdkJudgeRun(
+  input: JudgeHarnessInput,
+  result: unknown,
+  output: JsonValue | undefined,
+): HarnessRun {
+  const usage = resolveUsage(result);
+  return {
+    output,
+    session: resolveSession(
+      input.prompt,
+      result,
+      output,
+      new Map(),
+      [],
+      undefined,
+    ),
+    usage,
+    errors: [],
+  };
+}
+
+function formatAiSdkJudgeSystemPrompt(
+  system: string | undefined,
+  responseFormat: JudgeHarnessInput["responseFormat"],
+) {
+  if (responseFormat?.type !== "json" || responseFormat.schema !== undefined) {
+    return system;
+  }
+
+  const jsonInstruction =
+    "Return only valid JSON. Do not include markdown fences or explanatory prose.";
+
+  return system ? `${system}\n\n${jsonInstruction}` : jsonInstruction;
+}
+
+type StepLike = Pick<
+  StepResult<ToolSet>,
+  | "content"
+  | "finishReason"
+  | "model"
+  | "rawFinishReason"
+  | "reasoningText"
+  | "response"
+  | "stepNumber"
+  | "text"
+  | "toolCalls"
+  | "toolResults"
+  | "usage"
+>;
+
+type AiSdkLikeResult = {
+  steps?: StepLike[];
+  usage?: LanguageModelUsage;
+  totalUsage?: LanguageModelUsage;
+  output?: unknown;
+  object?: unknown;
+  text?: string;
+  session?: NormalizedSession;
+  errors?: Array<Record<string, JsonValue>>;
+};
+
+type AiSdkResultOutput<TResult> = TResult extends HarnessRun<infer TOutput>
+  ? TOutput
+  : "output" extends keyof TResult
+    ? ResultFieldOutput<TResult, "output">
+    : "object" extends keyof TResult
+      ? ResultFieldOutput<TResult, "object">
+      : "text" extends keyof TResult
+        ? ResultFieldOutput<TResult, "text">
+        : undefined;
+type AiSdkAgentResult<
+  TAgent,
+  TInput,
+  TTools extends AiSdkToolset<TInput>,
+> = TAgent extends {
+  run: (
+    input: TInput,
+    runtime: AiSdkRuntime<TTools, TInput>,
+  ) => MaybePromise<infer TResult>;
+}
+  ? Awaited<TResult>
+  : TAgent extends {
+        generate: (
+          input: TInput,
+          runtime: AiSdkRuntime<TTools, TInput>,
+        ) => MaybePromise<infer TResult>;
+      }
+    ? Awaited<TResult>
+    : unknown;
+
+/** Context passed to instrumented AI SDK tool executions. */
+export interface AiSdkToolContext<TInput = string> {
+  input: TInput;
+  signal?: AbortSignal;
+  setArtifact: HarnessContext["setArtifact"];
+  execution: ToolExecutionOptions;
+}
+
+/** Replay mode alias used by the AI SDK harness package. */
+export type AiSdkReplayMode = ReplayMode;
+
+/** Tool replay recording shape for AI SDK tools. */
+export type AiSdkToolRecording<
+  TArgs extends JsonValue = JsonValue,
+  TResult extends JsonValue = JsonValue,
+> = ToolRecording<TArgs, TResult>;
+
+/** Replay configuration for an AI SDK tool. */
+export type AiSdkToolReplayConfig<
+  TArgs extends JsonValue = JsonValue,
+  TResult extends JsonValue = JsonValue,
+  TInput = string,
+> = ToolReplayConfig<TArgs, TResult, AiSdkToolContext<TInput>>;
+
+/** AI SDK tool definition accepted by the harness. */
+export type AiSdkToolDefinition<
+  TArgs extends JsonValue = JsonValue,
+  TResult extends JsonValue = JsonValue,
+  _TInput = string,
+> = Tool<TArgs, TResult>;
+
+/** Replay policy for one AI SDK tool. */
+export type AiSdkToolReplayPolicy<TInput = string> =
+  | boolean
+  | AiSdkToolReplayConfig<JsonValue, JsonValue, TInput>;
+
+/** Replay policy map keyed by AI SDK tool name. */
+export type AiSdkToolReplayPolicies<TInput = string> = Record<
+  string,
+  AiSdkToolReplayPolicy<TInput>
+>;
+
+/** Toolset shape accepted by the AI SDK harness. */
+export type AiSdkToolset<TInput = string> = AnyAiSdkToolset<TInput>;
+
+/** Runtime toolset exposed to the system under test. */
+export type AiSdkRuntimeToolset<TTools extends AnyAiSdkToolset<any>> = {
+  [K in keyof TTools]: TTools[K] extends AiSdkToolDefinition<
+    infer TArgs extends JsonValue,
+    infer TResult extends JsonValue,
+    infer _TInput
+  >
+    ? Omit<TTools[K], "execute"> & {
+        execute?: ToolExecuteFunction<TArgs, TResult>;
+      }
+    : TTools[K];
+};
+
+/** Runtime object passed into AI SDK-style agent entrypoints. */
+export interface AiSdkRuntime<
+  TTools extends AiSdkToolset<TInput>,
+  TInput = string,
+> {
+  tools: AiSdkRuntimeToolset<TTools>;
+  signal?: AbortSignal;
+}
+
+/** Arguments passed to per-run AI SDK agent factories. */
+export interface AiSdkCreateAgentArgs<TInput = string> {
+  input: TInput;
+  context: HarnessContext;
+}
+
+/** Arguments passed to custom AI SDK harness run callbacks. */
+export interface AiSdkHarnessRunArgs<
+  TAgent,
+  TInput,
+  TTools extends AiSdkToolset<TInput>,
+> {
+  agent: TAgent | undefined;
+  input: TInput;
+  context: HarnessContext;
+  runtime: AiSdkRuntime<TTools, TInput>;
+  tools: AiSdkRuntimeToolset<TTools>;
+}
+
+/** Arguments passed to AI SDK harness output selectors. */
+export interface AiSdkHarnessResultArgs<
+  TAgent,
+  TInput,
+  TResult,
+  TTools extends AiSdkToolset<TInput>,
+> extends AiSdkHarnessRunArgs<TAgent, TInput, TTools> {
+  result: TResult;
+}
+
+type AiSdkHarnessOutputSelector<
+  TAgent,
+  TInput,
+  TResult,
+  TTools extends AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined,
+> = (
+  args: AiSdkHarnessResultArgs<TAgent, TInput, TResult, TTools>,
+) => MaybePromise<TOutput>;
+
+type AiSdkHarnessOptions<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined = JsonValue | undefined,
+> = AiSdkHarnessBaseOptions<TAgent, TInput, TResult, TTools, TOutput> &
+  (
+    | {
+        agent: AgentSource<TAgent, TInput>;
+        run?: never;
+      }
+    | {
+        run: (
+          args: AiSdkHarnessRunArgs<TAgent, TInput, TTools>,
+        ) => MaybePromise<TResult | HarnessRun<TOutput>>;
+        agent?: never;
+      }
+  );
+
+type AiSdkHarnessOptionsWithOutput<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined = JsonValue | undefined,
+> = AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput> & {
+  output: AiSdkHarnessOutputSelector<TAgent, TInput, TResult, TTools, TOutput>;
+};
+
+type AiSdkHarnessRunOptionsWithoutOutput<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+> = AiSdkHarnessBaseOptions<
+  TAgent,
+  TInput,
+  TResult,
+  TTools,
+  JsonValue | undefined
+> & {
+  run: (
+    args: AiSdkHarnessRunArgs<TAgent, TInput, TTools>,
+  ) => MaybePromise<TResult>;
+  agent?: never;
+  output?: never;
+};
+
+type AiSdkHarnessAgentOptionsWithoutOutput<
+  TAgent = unknown,
+  TInput = string,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+> = AiSdkHarnessBaseOptions<
+  TAgent,
+  TInput,
+  unknown,
+  TTools,
+  JsonValue | undefined
+> & {
+  agent: AgentSource<TAgent, TInput>;
+  run?: never;
+  output?: never;
+};
+
+interface AiSdkHarnessBaseOptions<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined = JsonValue | undefined,
+> {
+  tools?: TTools;
+  toolReplay?: AiSdkToolReplayPolicies<TInput>;
+  output?: AiSdkHarnessOutputSelector<TAgent, TInput, TResult, TTools, TOutput>;
+  name?: string;
+}
+
+type AiSdkRunnableAgent<
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+> = {
+  run: (
+    input: TInput,
+    runtime: AiSdkRuntime<TTools, TInput>,
+  ) => MaybePromise<TResult | HarnessRun<TOutput>>;
+};
+
+type AiSdkGeneratableAgent<
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+> = {
+  generate: (
+    input: TInput,
+    runtime: AiSdkRuntime<TTools, TInput>,
+  ) => MaybePromise<TResult | HarnessRun<TOutput>>;
+};
+
+/** Adapts an AI SDK-style workflow into a normalized eval harness. */
+export function aiSdkHarness<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined = JsonValue | undefined,
+>(
+  options: AiSdkHarnessOptionsWithOutput<
+    TAgent,
+    TInput,
+    TResult,
+    TTools,
+    TOutput
+  >,
+): Harness<TInput, TOutput>;
+export function aiSdkHarness<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessRunOptionsWithoutOutput<TAgent, TInput, TResult, TTools>,
+): Harness<TInput, AiSdkResultOutput<Awaited<TResult>>>;
+export function aiSdkHarness<
+  TAgent = unknown,
+  TInput = string,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessAgentOptionsWithoutOutput<TAgent, TInput, TTools>,
+): Harness<TInput, AiSdkResultOutput<AiSdkAgentResult<TAgent, TInput, TTools>>>;
+export function aiSdkHarness<
+  TAgent = unknown,
+  TInput = string,
+  TResult = unknown,
+  TTools extends AiSdkToolset<TInput> = AiSdkToolset<TInput>,
+  TOutput extends JsonValue | undefined = JsonValue | undefined,
+>(
+  options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>,
+): Harness<TInput, TOutput> {
+  validateOptions(options);
+
+  const harnessName = options.name ?? "ai-sdk";
+  const harness: Harness<TInput, TOutput> = {
+    name: harnessName,
+    run: async (input, context) => {
+      const startedAt = new Date();
+
+      try {
+        const agent = await resolveAgent(options, {
+          input,
+          context,
+        });
+        return await runAiSdkHarness(options, agent, input, context);
+      } catch (error) {
+        if (getHarnessRunFromError(error)) {
+          throw error;
+        }
+
+        throw attachHarnessRunToError(
+          error,
+          createFailedAiSdkRun(input, context, error, harnessName, startedAt),
+        );
+      }
+    },
+  };
+
+  return harness;
+}
+
+function createFailedAiSdkRun<TInput>(
+  input: TInput,
+  context: HarnessContext,
+  error: unknown,
+  harnessName: string,
+  startedAt: Date,
+) {
+  const run = createFailedHarnessRun(input, error, {
+    artifacts: context.artifacts,
+  });
+  ensureRunTrace(run, {
+    name: harnessName,
+    startedAt,
+    finishedAt: new Date(),
+    operationName: "invoke_workflow",
+    source: "harness-ai-sdk",
+  });
+
+  return run;
+}
+
+async function runAiSdkHarness<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>,
+  agent: TAgent | undefined,
+  input: TInput,
+  context: HarnessContext,
+): Promise<HarnessRun<TOutput>> {
+  const trace = createTraceRecorder(options.name ?? "ai-sdk");
+  const replayMetadataByToolCallId = new Map<string, ReplayMetadata>();
+  const runtimeEvents: TranscriptEvent[] = [];
+  const tools = createToolset({
+    input,
+    context,
+    tools: options.tools,
+    toolReplay: options.toolReplay,
+    replayMetadataByToolCallId,
+    runtimeEvents,
+  });
+  const runtime = {
+    tools,
+    signal: context.signal,
+  } satisfies AiSdkRuntime<TTools, TInput>;
+
+  try {
+    const result = await runAgent(options, {
+      agent,
+      input,
+      context,
+      runtime,
+      tools,
+    });
+
+    if (isHarnessRun(result) && !hasOutputSelector(options)) {
+      if (Object.keys(context.artifacts).length > 0 && !result.artifacts) {
+        result.artifacts = context.artifacts;
+      }
+      attachAiSdkTrace(result, trace, result, new Date());
+      return result;
+    }
+
+    const resultArgs = {
+      agent,
+      input,
+      context,
+      runtime,
+      tools,
+      result: result as TResult,
+    } satisfies AiSdkHarnessResultArgs<TAgent, TInput, TResult, TTools>;
+
+    const output = options.output
+      ? await options.output(resultArgs)
+      : (resolveOutput(result) as TOutput | undefined);
+    const explicitSession = getResultSession(result);
+    const useRuntimeEvents = shouldUseRuntimeEvents(result);
+    const usage = resolveUsage(
+      result,
+      useRuntimeEvents ? runtimeEvents : [],
+      explicitSession,
+    );
+    const session = resolveSession(
+      input,
+      result,
+      output,
+      replayMetadataByToolCallId,
+      runtimeEvents,
+      explicitSession,
+    );
+    const errors = resolveHarnessRunErrors(result);
+    const finishedAt = new Date();
+
+    return {
+      session,
+      output,
+      usage,
+      artifacts:
+        Object.keys(context.artifacts).length > 0
+          ? context.artifacts
+          : undefined,
+      errors,
+      traces: [
+        finishAiSdkTrace(trace, {
+          result,
+          session,
+          usage,
+          errors,
+          finishedAt,
+        }),
+      ],
+    } as HarnessRun<TOutput>;
+  } catch (error) {
+    const finishedAt = new Date();
+    const serializedError = serializeError(error);
+    const runtimeToolCallCount = runtimeEvents.filter(
+      (event) => event.type === "tool_call",
+    ).length;
+    const usage =
+      runtimeToolCallCount > 0 ? { toolCalls: runtimeToolCallCount } : {};
+    const session = resolveFailureSession(input, runtimeEvents);
+    const run = {
+      session,
+      output: undefined,
+      usage,
+      artifacts:
+        Object.keys(context.artifacts).length > 0
+          ? context.artifacts
+          : undefined,
+      errors: [serializedError],
+      traces: [
+        finishAiSdkTrace(trace, {
+          session,
+          usage,
+          errors: [serializedError],
+          finishedAt,
+        }),
+      ],
+    } satisfies HarnessRun;
+
+    throw attachHarnessRunToError(error, run);
+  }
+}
+
+function hasOutputSelector<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(options: AiSdkHarnessBaseOptions<TAgent, TInput, TResult, TTools, TOutput>) {
+  return Boolean(options.output);
+}
+
+async function resolveAgent<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>,
+  args: AiSdkCreateAgentArgs<TInput>,
+) {
+  return hasAgentSource(options)
+    ? await resolveAgentSource(options.agent, args)
+    : undefined;
+}
+
+async function runAgent<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>,
+  args: AiSdkHarnessRunArgs<TAgent, TInput, TTools>,
+): Promise<TResult | HarnessRun<TOutput>> {
+  if (options.run) {
+    return options.run(args);
+  }
+
+  if (hasAiSdkRunMethod<TInput, TResult, TOutput, TTools>(args.agent)) {
+    return args.agent.run(args.input, args.runtime);
+  }
+
+  if (hasAiSdkGenerateMethod<TInput, TResult, TOutput, TTools>(args.agent)) {
+    return args.agent.generate(args.input, args.runtime);
+  }
+
+  throw new Error(
+    "aiSdkHarness agent must expose run(input, runtime) or generate(input, runtime), or use run() for a custom entrypoint.",
+  );
+}
+
+function validateOptions<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>) {
+  const hasAgent = hasAgentSource(options);
+  const hasRun = typeof (options as { run?: unknown }).run === "function";
+  const entrypoints = [hasAgent, hasRun].filter(Boolean).length;
+
+  if (entrypoints > 1) {
+    throw new Error(
+      "aiSdkHarness accepts exactly one of agent or run. Use agent for the zero-glue run(input, runtime) or generate(input, runtime) path, or run for a custom entrypoint.",
+    );
+  }
+
+  if (entrypoints === 0) {
+    throw new Error(
+      "aiSdkHarness requires agent or run. Use agent for objects with run(input, runtime) or generate(input, runtime), or run for a custom entrypoint.",
+    );
+  }
+}
+
+function hasAgentSource<
+  TAgent,
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  options: AiSdkHarnessOptions<TAgent, TInput, TResult, TTools, TOutput>,
+): options is AiSdkHarnessBaseOptions<
+  TAgent,
+  TInput,
+  TResult,
+  TTools,
+  TOutput
+> & { agent: AgentSource<TAgent, TInput> } {
+  return "agent" in options && options.agent !== undefined;
+}
+
+async function resolveAgentSource<TAgent, TInput>(
+  agent: AgentSource<TAgent, TInput>,
+  args: AiSdkCreateAgentArgs<TInput>,
+): Promise<TAgent> {
+  if (isAgentFactory(agent)) {
+    return agent(args);
+  }
+
+  return agent;
+}
+
+function hasAiSdkRunMethod<
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  agent: unknown,
+): agent is AiSdkRunnableAgent<TInput, TResult, TOutput, TTools> {
+  return hasCallableMethod(agent, "run");
+}
+
+function hasAiSdkGenerateMethod<
+  TInput,
+  TResult,
+  TOutput extends JsonValue | undefined,
+  TTools extends AiSdkToolset<TInput>,
+>(
+  agent: unknown,
+): agent is AiSdkGeneratableAgent<TInput, TResult, TOutput, TTools> {
+  return hasCallableMethod(agent, "generate");
+}
+
+function isAgentFactory<TAgent, TInput>(
+  agent: AgentSource<TAgent, TInput>,
+): agent is (args: AiSdkCreateAgentArgs<TInput>) => MaybePromise<TAgent> {
+  return (
+    typeof agent === "function" &&
+    !hasCallableMethod(agent, "run") &&
+    !hasCallableMethod(agent, "generate")
+  );
+}
+
+type TraceRecorder = {
+  id: string;
+  rootSpanId: string;
+  name: string;
+  startedAt: Date;
+};
+
+function createTraceRecorder(name: string): TraceRecorder {
+  const id = `ai_sdk_trace_${++nextTraceId}`;
+
+  return {
+    id,
+    rootSpanId: `${id}:run`,
+    name,
+    startedAt: new Date(),
+  };
+}
+
+function attachAiSdkTrace(
+  run: HarnessRun,
+  trace: TraceRecorder,
+  result: unknown,
+  finishedAt: Date,
+) {
+  const errors = run.errors ?? [];
+  const nativeTrace = finishAiSdkTrace(trace, {
+    result,
+    session: run.session,
+    usage: run.usage,
+    errors,
+    finishedAt,
+  });
+
+  run.traces = [...(run.traces ?? []), nativeTrace];
+}
+
+function finishAiSdkTrace(
+  trace: TraceRecorder,
+  options: {
+    result?: unknown;
+    session: NormalizedSession;
+    usage?: UsageSummary;
+    errors?: unknown[];
+    finishedAt: Date;
+  },
+): NormalizedTrace {
+  const modelSpans = createAiSdkModelSpans(
+    trace,
+    options.result,
+    options.usage,
+  );
+  const finishedAt = options.finishedAt;
+  const durationMs = finishedAt.getTime() - trace.startedAt.getTime();
+  const rootError = options.errors?.[0]
+    ? normalizeSpanError(options.errors[0])
+    : undefined;
+  const rootSpan: NormalizedSpan = {
+    id: trace.rootSpanId,
+    traceId: trace.id,
+    name: trace.name,
+    kind: "run",
+    startedAt: trace.startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    durationMs,
+    status: rootError ? "error" : "ok",
+    ...(rootError ? { error: rootError } : {}),
+    attributes: normalizeSpanAttributes({
+      "gen_ai.operation.name": "invoke_workflow",
+      "gen_ai.workflow.name": trace.name,
+      ...createGenAiUsageAttributes(options.usage),
+    }),
+  };
+  const spans = [rootSpan, ...modelSpans];
+
+  return {
+    id: trace.id,
+    name: trace.name,
+    startedAt: trace.startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    durationMs,
+    metadata: {
+      source: "harness-ai-sdk",
+    },
+    spans,
+  };
+}
+
+function createAiSdkModelSpans(
+  trace: TraceRecorder,
+  result: unknown,
+  usage: UsageSummary | undefined,
+): NormalizedSpan[] {
+  const steps = readAiSdkSteps(result);
+  if (steps.length === 0) {
+    const fallback = createUsageModelSpan(trace, usage);
+    return fallback ? [fallback] : [];
+  }
+
+  return steps.map((step, index) => {
+    const stepUsage = step.usage;
+
+    return {
+      id: `${trace.id}:model:${index + 1}`,
+      traceId: trace.id,
+      parentId: trace.rootSpanId,
+      name: `ai-sdk step ${step.stepNumber ?? index}`,
+      kind: "model",
+      status: "ok",
+      attributes: normalizeSpanAttributes({
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": step.model?.provider,
+        "gen_ai.request.model": step.model?.modelId,
+        "gen_ai.response.model": step.model?.modelId,
+        "gen_ai.response.finish_reasons": step.finishReason
+          ? [String(step.finishReason)]
+          : undefined,
+        "gen_ai.usage.input_tokens": stepUsage?.inputTokens,
+        "gen_ai.usage.output_tokens": stepUsage?.outputTokens,
+        "gen_ai.usage.reasoning.output_tokens":
+          stepUsage?.outputTokenDetails?.reasoningTokens ??
+          stepUsage?.reasoningTokens,
+        "gen_ai.usage.cache_read.input_tokens":
+          stepUsage?.inputTokenDetails?.cacheReadTokens ??
+          stepUsage?.cachedInputTokens,
+        "gen_ai.usage.cache_creation.input_tokens":
+          stepUsage?.inputTokenDetails?.cacheWriteTokens,
+        "ai.step.number": step.stepNumber,
+        "ai.finish_reason": step.finishReason,
+        "ai.raw_finish_reason": step.rawFinishReason,
+      }),
+    } satisfies NormalizedSpan;
+  });
+}
+
+function createUsageModelSpan(
+  trace: TraceRecorder,
+  usage: UsageSummary | undefined,
+): NormalizedSpan | undefined {
+  if (!usage?.provider && !usage?.model) {
+    return undefined;
+  }
+
+  return {
+    id: `${trace.id}:model:1`,
+    traceId: trace.id,
+    parentId: trace.rootSpanId,
+    name: usage.model ? `ai-sdk ${usage.model}` : "ai-sdk model",
+    kind: "model",
+    status: "ok",
+    attributes: normalizeSpanAttributes({
+      "gen_ai.operation.name": "chat",
+      ...createGenAiUsageAttributes(usage),
+    }),
+  };
+}
+
+function createToolset<TInput, TTools extends AiSdkToolset<TInput>>({
+  input,
+  context,
+  tools,
+  toolReplay,
+  replayMetadataByToolCallId,
+  runtimeEvents,
+}: {
+  input: TInput;
+  context: HarnessContext;
+  tools: TTools | undefined;
+  toolReplay: AiSdkToolReplayPolicies<TInput> | undefined;
+  replayMetadataByToolCallId: Map<string, ReplayMetadata>;
+  runtimeEvents: TranscriptEvent[];
+}) {
+  return Object.fromEntries(
+    Object.entries(tools ?? {}).map(([toolName, tool]) => {
+      const replay = toolReplay?.[toolName];
+
+      if (replay && !tool.execute) {
+        throw new Error(
+          `Tool replay requires execute() for ${toolName}. Provider-executed tools cannot be recorded automatically.`,
+        );
+      }
+
+      if (!tool.execute) {
+        return [toolName, tool];
+      }
+
+      const execute = tool.execute;
+      const wrappedTool = {
+        ...tool,
+        execute: async (
+          toolInput: InferToolInput<typeof tool>,
+          execution: ToolExecutionOptions,
+        ) => {
+          const startedAt = new Date();
+          const normalizedArgs = normalizeArguments(toolInput);
+          const call: TranscriptToolCallEvent = {
+            type: "tool_call",
+            id: execution.toolCallId,
+            name: toolName,
+            ...(normalizedArgs ? { arguments: normalizedArgs } : {}),
+            startedAt: startedAt.toISOString(),
+          };
+          runtimeEvents.push(call);
+          const replayContext = {
+            input,
+            signal: context.signal,
+            setArtifact: context.setArtifact,
+            execution,
+          } satisfies AiSdkToolContext<TInput>;
+
+          try {
+            const executionResult = replay
+              ? await executeToolWithReplay({
+                  toolName,
+                  toolInput,
+                  execute,
+                  execution,
+                  context: replayContext,
+                  replay,
+                })
+              : {
+                  result: await execute(toolInput, execution),
+                  replay: undefined,
+                };
+            const finishedAt = new Date();
+            const replayMetadata = normalizeReplayMetadata(
+              executionResult.replay,
+            );
+
+            if (executionResult.replay) {
+              replayMetadataByToolCallId.set(
+                execution.toolCallId,
+                executionResult.replay,
+              );
+            }
+
+            call.finishedAt = finishedAt.toISOString();
+            call.durationMs = finishedAt.getTime() - startedAt.getTime();
+            if (replayMetadata) {
+              call.metadata = replayMetadata;
+            }
+            const normalizedResult = toJsonValue(executionResult.result);
+            runtimeEvents.push({
+              type: "tool_result",
+              toolCallId: execution.toolCallId,
+              name: toolName,
+              ...(normalizedResult !== undefined
+                ? { content: normalizedResult }
+                : {}),
+              startedAt: call.startedAt,
+              finishedAt: call.finishedAt,
+              durationMs: call.durationMs,
+            });
+
+            return executionResult.result as InferToolOutput<typeof tool>;
+          } catch (error) {
+            const replay = getReplayMetadataFromError(error);
+            const finishedAt = new Date();
+            const replayMetadata = normalizeReplayMetadata(replay);
+
+            if (replay) {
+              replayMetadataByToolCallId.set(execution.toolCallId, replay);
+            }
+
+            call.finishedAt = finishedAt.toISOString();
+            call.durationMs = finishedAt.getTime() - startedAt.getTime();
+            if (replayMetadata) {
+              call.metadata = replayMetadata;
+            }
+            runtimeEvents.push({
+              type: "tool_result",
+              toolCallId: execution.toolCallId,
+              name: toolName,
+              error: normalizeError(error),
+              startedAt: call.startedAt,
+              finishedAt: call.finishedAt,
+              durationMs: call.durationMs,
+            });
+            throw error;
+          }
+        },
+      } satisfies typeof tool;
+
+      return [toolName, wrappedTool];
+    }),
+  ) as AiSdkRuntimeToolset<TTools>;
+}
+
+async function executeToolWithReplay<
+  TInput,
+  TTool extends AiSdkToolDefinition<any, any, TInput>,
+>({
+  toolName,
+  toolInput,
+  execute,
+  execution,
+  context,
+  replay,
+}: {
+  toolName: string;
+  toolInput: InferToolInput<TTool>;
+  execute: NonNullable<TTool["execute"]>;
+  execution: ToolExecutionOptions;
+  context: AiSdkToolContext<TInput>;
+  replay: AiSdkToolReplayPolicy<TInput>;
+}) {
+  const replayInput = toReplayJsonValue(toolInput, `${toolName} tool input`);
+
+  return executeWithReplay<JsonValue, JsonValue, AiSdkToolContext<TInput>>({
+    toolName,
+    args: replayInput,
+    context,
+    execute: async (replayedInput) => {
+      const output = await execute(
+        replayedInput as InferToolInput<TTool>,
+        execution,
+      );
+
+      if (isAsyncIterable(output)) {
+        throw new Error(
+          `Tool replay only supports JSON-serializable outputs. ${toolName} returned an async iterable.`,
+        );
+      }
+
+      return toReplayJsonValue(output, `${toolName} tool output`);
+    },
+    replay,
+  });
+}
+
+function resolveOutput(result: unknown): JsonValue | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+
+  const candidates = ["output", "object", "text"] satisfies string[];
+  const resultRecord = result as Record<string, unknown>;
+
+  for (const key of candidates) {
+    if (Object.prototype.hasOwnProperty.call(resultRecord, key)) {
+      return toOutputValue(resultRecord[key]);
+    }
+  }
+
+  return undefined;
+}
+
+// Keep this adapter-local rather than exporting a core helper. Core
+// `toJsonValue` normalizes trace data; inferred app output should only accept
+// values that are already JSON-safe so the public contract stays explicit.
+// Invalid nested values reject the whole candidate instead of being patched.
+function toOutputValue(value: unknown): JsonValue | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  if (Array.isArray(value)) {
+    const items: JsonValue[] = [];
+    for (const item of value) {
+      const normalized = toOutputValue(item);
+      if (normalized === undefined) {
+        return undefined;
+      }
+      items.push(normalized);
+    }
+    return items;
+  }
+
+  if (typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return undefined;
+    }
+
+    const record: Record<string, JsonValue> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const normalized = toOutputValue(entry);
+      if (normalized === undefined) {
+        return undefined;
+      }
+      record[key] = normalized;
+    }
+    return record;
+  }
+
+  return undefined;
+}
+
+function resolveUsage(
+  result: unknown,
+  runtimeEvents: TranscriptEvent[] = [],
+  explicitSession?: NormalizedSession,
+): UsageSummary {
+  const steps = readAiSdkSteps(result);
+  const runtimeToolCallCount = countRuntimeToolCalls(runtimeEvents);
+  const explicitSessionToolCallCount = explicitSession
+    ? countSessionToolCalls(explicitSession)
+    : undefined;
+  const usage = readAiSdkUsage(result, steps);
+  const lastStep = steps.length > 0 ? steps[steps.length - 1] : undefined;
+  // Runtime events count only for custom runs without AI SDK steps, so usage
+  // stays aligned with the same transcript source used for assertions.
+  const toolCallCount =
+    explicitSessionToolCallCount ??
+    (steps.length > 0 ? countStepToolCalls(steps) : runtimeToolCallCount);
+
+  if (!usage) {
+    if (toolCallCount > 0 || steps.length > 0) {
+      return {
+        provider: lastStep?.model?.provider,
+        model: lastStep?.model?.modelId,
+        ...(toolCallCount > 0 ? { toolCalls: toolCallCount } : {}),
+      };
+    }
+
+    return {};
+  }
+
+  return {
+    provider: lastStep?.model?.provider,
+    model: lastStep?.model?.modelId,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningTokens:
+      usage.outputTokenDetails?.reasoningTokens ?? usage.reasoningTokens,
+    totalTokens:
+      usage.totalTokens ?? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+    toolCalls: toolCallCount > 0 ? toolCallCount : undefined,
+    metadata: normalizeMetadata({
+      cacheReadTokens:
+        usage.inputTokenDetails?.cacheReadTokens ?? usage.cachedInputTokens,
+      cacheWriteTokens: usage.inputTokenDetails?.cacheWriteTokens,
+      raw: usage.raw,
+    }),
+  };
+}
+
+function countRuntimeToolCalls(events: readonly TranscriptEvent[]) {
+  return events.filter((event) => event.type === "tool_call").length;
+}
+
+function resolveStepUsage(steps: StepLike[]): LanguageModelUsage | undefined {
+  const usages = steps.map((step) => step.usage).filter(isLanguageModelUsage);
+
+  if (usages.length === 0) {
+    return undefined;
+  }
+
+  return usages.reduce(addLanguageModelUsage);
+}
+
+function addLanguageModelUsage(
+  left: LanguageModelUsage,
+  right: LanguageModelUsage,
+): LanguageModelUsage {
+  return {
+    inputTokens: addTokenCounts(left.inputTokens, right.inputTokens),
+    inputTokenDetails: {
+      noCacheTokens: addTokenCounts(
+        left.inputTokenDetails?.noCacheTokens,
+        right.inputTokenDetails?.noCacheTokens,
+      ),
+      cacheReadTokens: addTokenCounts(
+        left.inputTokenDetails?.cacheReadTokens,
+        right.inputTokenDetails?.cacheReadTokens,
+      ),
+      cacheWriteTokens: addTokenCounts(
+        left.inputTokenDetails?.cacheWriteTokens,
+        right.inputTokenDetails?.cacheWriteTokens,
+      ),
+    },
+    outputTokens: addTokenCounts(left.outputTokens, right.outputTokens),
+    outputTokenDetails: {
+      textTokens: addTokenCounts(
+        left.outputTokenDetails?.textTokens,
+        right.outputTokenDetails?.textTokens,
+      ),
+      reasoningTokens: addTokenCounts(
+        left.outputTokenDetails?.reasoningTokens,
+        right.outputTokenDetails?.reasoningTokens,
+      ),
+    },
+    totalTokens: addTokenCounts(left.totalTokens, right.totalTokens),
+    reasoningTokens: addTokenCounts(
+      left.reasoningTokens,
+      right.reasoningTokens,
+    ),
+    cachedInputTokens: addTokenCounts(
+      left.cachedInputTokens,
+      right.cachedInputTokens,
+    ),
+  };
+}
+
+function addTokenCounts(left: number | undefined, right: number | undefined) {
+  return left == null && right == null ? undefined : (left ?? 0) + (right ?? 0);
+}
+
+function countStepToolCalls(steps: StepLike[]) {
+  return steps.reduce(
+    (count, step) => count + (step.toolCalls?.length ?? 0),
+    0,
+  );
+}
+
+function countSessionToolCalls(session: NormalizedSession) {
+  return session.events.filter((event) => event.type === "tool_call").length;
+}
+
+function shouldUseRuntimeEvents(result: unknown) {
+  if (
+    isNormalizedSession(
+      (result as Record<string, unknown> | undefined)?.session,
+    )
+  ) {
+    return false;
+  }
+
+  return readAiSdkSteps(result).length === 0;
+}
+
+function resolveSession(
+  input: unknown,
+  result: unknown,
+  output: JsonValue | undefined,
+  replayMetadataByToolCallId: Map<string, ReplayMetadata>,
+  runtimeEvents: TranscriptEvent[] = [],
+  explicitSession = getResultSession(result),
+): NormalizedSession {
+  if (explicitSession) {
+    return explicitSession;
+  }
+
+  const steps = readAiSdkSteps(result);
+  const events: TranscriptEvent[] = [
+    {
+      type: "message",
+      role: "user",
+      content: normalizeContent(input),
+    },
+  ];
+
+  for (const step of steps) {
+    events.push(...normalizeStep(step, replayMetadataByToolCallId));
+  }
+
+  // Runtime events are only the transcript source when no AI SDK steps exist;
+  // explicit sessions returned above and provider steps stay authoritative.
+  if (steps.length === 0) {
+    events.push(...runtimeEvents);
+  }
+
+  if (
+    output !== undefined &&
+    !events.some(
+      (event) =>
+        event.type === "message" &&
+        event.role === "assistant" &&
+        event.content !== undefined,
+    )
+  ) {
+    events.push({
+      type: "message",
+      role: "assistant",
+      content: output,
+    });
+  }
+
+  const lastStep = steps.length > 0 ? steps[steps.length - 1] : undefined;
+
+  return {
+    events,
+    provider: lastStep?.model?.provider,
+    model: lastStep?.model?.modelId,
+  };
+}
+
+function getResultSession(result: unknown): NormalizedSession | undefined {
+  const session = (result as Record<string, unknown> | undefined)?.session;
+  return isNormalizedSession(session) ? session : undefined;
+}
+
+function resolveFailureSession(
+  input: unknown,
+  runtimeEvents: TranscriptEvent[],
+): NormalizedSession {
+  return {
+    events: [
+      {
+        type: "message",
+        role: "user",
+        content: normalizeContent(input),
+      },
+      ...runtimeEvents,
+    ],
+  };
+}
+
+/** Reads AI SDK step arrays only when the field looks like provider step data. */
+function readAiSdkSteps(result: unknown): StepLike[] {
+  if (!result || typeof result !== "object") {
+    return [];
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(result, "steps")) {
+    return [];
+  }
+
+  const steps = (result as AiSdkLikeResult).steps;
+  if (!Array.isArray(steps)) {
+    return [];
+  }
+  if (steps.length > 0 && !steps.every(isAiSdkStepLike)) {
+    return [];
+  }
+
+  return steps;
+}
+
+function isAiSdkStepLike(step: unknown): step is StepLike {
+  if (!step || typeof step !== "object") {
+    return false;
+  }
+
+  const record = step as Record<string, unknown>;
+  return (
+    Array.isArray(record.content) ||
+    Array.isArray(record.toolCalls) ||
+    Array.isArray(record.toolResults) ||
+    Boolean(record.response && typeof record.response === "object") ||
+    Boolean(record.usage && typeof record.usage === "object") ||
+    typeof record.finishReason === "string" ||
+    typeof record.stepNumber === "number" ||
+    typeof record.text === "string"
+  );
+}
+
+function readAiSdkUsage(
+  result: unknown,
+  steps: StepLike[],
+): LanguageModelUsage | undefined {
+  // AI SDK generateText exposes aggregate `totalUsage`; `usage` is the last
+  // step and only applies to non-step results such as generateObject.
+  const totalUsage = readUsageField(result, "totalUsage");
+  if (totalUsage) {
+    return totalUsage;
+  }
+
+  if (steps.length > 0) {
+    return resolveStepUsage(steps);
+  }
+
+  return readUsageField(result, "usage");
+}
+
+function readUsageField(
+  result: unknown,
+  field: "usage" | "totalUsage",
+): LanguageModelUsage | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+
+  const usage = (result as AiSdkLikeResult)[field];
+  return isLanguageModelUsage(usage) ? usage : undefined;
+}
+
+function isLanguageModelUsage(value: unknown): value is LanguageModelUsage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const usage = value as LanguageModelUsage;
+  return (
+    isOptionalFiniteNumber(usage.inputTokens) &&
+    isOptionalFiniteNumber(usage.outputTokens) &&
+    isOptionalFiniteNumber(usage.reasoningTokens) &&
+    isOptionalFiniteNumber(usage.totalTokens) &&
+    isOptionalFiniteNumber(usage.cachedInputTokens) &&
+    isUsageDetailObject(usage.inputTokenDetails) &&
+    isUsageDetailObject(usage.outputTokenDetails)
+  );
+}
+
+function isUsageDetailObject(value: unknown) {
+  if (value === undefined) {
+    return true;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  return Object.values(value).every(isOptionalFiniteNumber);
+}
+
+function isOptionalFiniteNumber(value: unknown) {
+  return (
+    value === undefined || (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+function normalizeStep(
+  step: StepLike,
+  replayMetadataByToolCallId: Map<string, ReplayMetadata>,
+): TranscriptEvent[] {
+  const toolResultsById = new Map(
+    (step.toolResults ?? []).map((toolResult) => [
+      toolResult.toolCallId,
+      toolResult,
+    ]),
+  );
+  const toolErrorsById = new Map(
+    (step.toolCalls ?? [])
+      .filter((toolCall) => toolCall.invalid || toolCall.error !== undefined)
+      .map((toolCall) => [
+        toolCall.toolCallId,
+        normalizeError(toolCall.error ?? toolCall.invalid),
+      ]),
+  );
+
+  const normalizedCalls = (step.toolCalls ?? []).map((toolCall) =>
+    normalizeToolCall(toolCall, toolResultsById, replayMetadataByToolCallId),
+  );
+  const assistantMetadata = normalizeMetadata({
+    stepNumber: step.stepNumber,
+    finishReason: step.finishReason,
+    rawFinishReason: step.rawFinishReason,
+    reasoningText: step.reasoningText,
+    response: step.response,
+  });
+  const events: TranscriptEvent[] = [];
+
+  if (step.text || assistantMetadata) {
+    events.push({
+      type: "message",
+      role: "assistant",
+      ...(step.text ? { content: step.text } : {}),
+      ...(assistantMetadata ? { metadata: assistantMetadata } : {}),
+    });
+  }
+
+  events.push(...normalizedCalls);
+
+  for (const toolResult of step.toolResults ?? []) {
+    const content =
+      toolResult.output === undefined
+        ? undefined
+        : normalizeContent(toolResult.output);
+    events.push({
+      type: "tool_result",
+      toolCallId: toolResult.toolCallId,
+      name: toolResult.toolName,
+      ...(content !== undefined ? { content } : {}),
+      ...(toolErrorsById.has(toolResult.toolCallId)
+        ? { error: toolErrorsById.get(toolResult.toolCallId) }
+        : {}),
+      metadata: normalizeMetadata({
+        preliminary: toolResult.preliminary,
+        providerExecuted: toolResult.providerExecuted,
+        title: toolResult.title,
+        providerMetadata: toolResult.providerMetadata,
+      }),
+    });
+  }
+
+  return events;
+}
+
+function normalizeToolCall(
+  toolCall: StepLike["toolCalls"][number],
+  toolResultsById: Map<string, StepLike["toolResults"][number]>,
+  replayMetadataByToolCallId: Map<string, ReplayMetadata>,
+): TranscriptToolCallEvent {
+  const toolResult = toolResultsById.get(toolCall.toolCallId);
+  const normalizedArguments = normalizeArguments(toolCall.input);
+  const errorValue =
+    toolCall.invalid || toolCall.error !== undefined
+      ? normalizeError(toolCall.error ?? toolCall.invalid)
+      : undefined;
+  const replayMetadata = normalizeReplayMetadata(
+    replayMetadataByToolCallId.get(toolCall.toolCallId),
+  );
+
+  return {
+    type: "tool_call",
+    id: toolCall.toolCallId,
+    name: toolCall.toolName,
+    ...(normalizedArguments ? { arguments: normalizedArguments } : {}),
+    metadata: normalizeMetadata({
+      providerExecuted:
+        toolCall.providerExecuted ?? toolResult?.providerExecuted,
+      title: toolCall.title ?? toolResult?.title,
+      dynamic: toolCall.dynamic,
+      invalid: toolCall.invalid,
+      ...(errorValue ? { error: errorValue } : {}),
+      preliminary: toolResult?.preliminary,
+      providerMetadata:
+        toolCall.providerMetadata ?? toolResult?.providerMetadata,
+      ...(replayMetadata ?? {}),
+    }),
+  };
+}
+
+function normalizeArguments(
+  value: unknown,
+): Record<string, JsonValue> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  return normalizeRecord(value as Record<string, unknown>);
+}
+
+function normalizeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      type: error.name,
+      message: error.message,
+    };
+  }
+
+  const normalized = toJsonValue(error);
+  if (
+    normalized &&
+    typeof normalized === "object" &&
+    !Array.isArray(normalized) &&
+    typeof normalized.message === "string"
+  ) {
+    return {
+      message: normalized.message,
+      type: typeof normalized.type === "string" ? normalized.type : "Error",
+    };
+  }
+
+  return {
+    type: "Error",
+    message: String(error ?? "Unknown tool call error"),
+  };
+}
+
+function toReplayJsonValue(value: unknown, label: string): JsonValue {
+  const normalized = toJsonValue(value);
+  if (normalized === undefined) {
+    throw new Error(
+      `Tool replay only supports JSON-serializable values. ${label} could not be normalized.`,
+    );
+  }
+
+  return normalized;
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    Symbol.asyncIterator in value
+  );
+}

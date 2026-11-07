@@ -1,0 +1,24 @@
+{
+  "name": "vitest-evals-docs",
+  "private": true,
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^5.0.6",
+    "@astrojs/starlight": "^0.39.2",
+    "@sentry/starlight-theme": "^0.9.1",
+    "@vercel/functions": "^2.0.0",
+    "astro": "^6.3.5",
+    "starlight-typedoc": "^0.22.0",
+    "vitest-evals": "workspace:*"
+  },
+  "devDependencies": {
+    "typedoc": "^0.28.19",
+    "typedoc-plugin-markdown": "^4.6.0"
+  }
+}

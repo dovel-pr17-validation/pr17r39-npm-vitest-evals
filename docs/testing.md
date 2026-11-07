@@ -1,0 +1,189 @@
+# Testing Standards for vitest-evals
+
+## Overview
+
+The repo now has two testing stories:
+
+- harness-first runtime and reporter behavior
+- legacy scorer compatibility
+
+New work should default to harness-first tests. Legacy tests still matter, but
+they should stay explicitly isolated.
+
+## Test Organization
+
+```text
+packages/vitest-evals/src/
+  harness.test.ts
+  reporter.test.ts
+  autoevals-compatibility.test.ts
+  ai-sdk-integration.test.ts
+  legacy/
+    evaluate/index.test.ts
+    scorers/*.test.ts
+packages/harness-ai-sdk/src/
+  index.test.ts
+packages/harness-openai-agents/src/
+  index.test.ts
+packages/harness-pi-ai/src/
+  index.test.ts
+packages/core/src/
+  index.test.ts
+  node.test.ts
+packages/github-reporter/src/
+  report.test.ts
+packages/report-ui/src/
+  server.test.ts
+  app/*.test.ts
+packages/report-ui/visual/
+  scenes.ts
+  report-ui.visual.ts
+apps/demo-pi/src/
+  refundAgent.test.ts
+apps/demo-openai-agents/src/
+  refundAgent.test.ts
+apps/demo-ai-sdk/evals/
+  *.eval.ts
+apps/demo-openai-agents/evals/
+  *.eval.ts
+apps/demo-pi/evals/
+  *.eval.ts
+```
+
+## What Must Be Tested
+
+### Root Harness/Judge Changes
+
+Cover:
+
+- explicit `run(...)` behavior
+- normalized run/session behavior
+- single-run semantics for automatic judges plus explicit assertions
+- matcher behavior for `toSatisfyJudge(...)`
+- any task metadata the reporter depends on
+
+### Reporter Changes
+
+Cover:
+
+- compact output
+- normal and info report levels
+- harness summaries
+- judge sub-results
+- failure formatting
+- replay/tool metadata when relevant
+
+### GitHub Reporter Changes
+
+Cover:
+
+- shared core schema/collector behavior when the persisted JSON contract
+  changes
+- native action input parsing when the workflow-facing contract changes
+- Vitest JSON metadata collection
+- sharded report merging when multiple JSON files are accepted
+- ASCII job summary rendering
+- long judge rationale handling without tables
+- workflow-command escaping
+- optional Check Run payloads and missing-configuration fallback
+- PR head SHA resolution for Check Runs on `pull_request`
+- soft-fail when a published Check Run owns a failed gate
+
+### Harness Package Changes
+
+Cover:
+
+- default runtime adaptation
+- escape hatches such as custom `run`, `output`, or `session`
+- error handling and partial-run attachment
+- usage/tool normalization
+- replay behavior for `@vitest-evals/harness-pi-ai`
+
+### Report UI Changes
+
+Cover data shaping, cost math, and server behavior with unit tests under
+`packages/report-ui/src/`.
+
+For layout or interaction changes, run the visual scenes:
+
+```bash
+pnpm exec playwright install chromium   # once, from packages/report-ui
+pnpm test:visual
+```
+
+`pnpm test:visual` builds the UI, serves the two visual fixtures (a baseline
+run and a later run) through `serveReportWorkspace` with bundled pricing, and
+drives each scene in `packages/report-ui/visual/scenes.ts` with Playwright.
+Every scene fails on uncaught page errors, `console.error`, failed requests,
+sideways page scroll, or overlapping controls in the same layer. Screenshots
+land in `packages/report-ui/.visual/`; CI uploads them as the
+`report-ui-visual` artifact for review.
+
+Add a scene when you add a view, panel, or responsive breakpoint. The suite
+does not diff pixels against baselines; review the screenshots in the PR
+instead.
+
+### Legacy Compatibility Changes
+
+If you touch scorer-first code, add tests under
+`packages/vitest-evals/src/legacy/...` and verify the legacy entrypoint still
+works.
+
+## Example Harness Test Pattern
+
+```ts
+describeEval(
+  "refund agent",
+  {
+    harness: piAiHarness({
+      agent: () => createRefundAgent(),
+    }),
+    judges: [ToolCallJudge()],
+  },
+  (it) => {
+    it("approves a refund", async ({ run }) => {
+      const result = await run("Refund invoice inv_123");
+
+      expect(result.output).toMatchObject({ status: "approved" });
+      expect(toolCalls(result).map((call) => call.name)).toEqual([
+        "lookupInvoice",
+        "createRefund",
+      ]);
+    });
+  },
+);
+```
+
+## Example Legacy Test Pattern
+
+```ts
+import { StructuredOutputScorer } from "vitest-evals/legacy";
+
+test("scores valid JSON output", async () => {
+  const scorer = StructuredOutputScorer();
+  const result = await scorer({
+    input: "Refund invoice inv_123",
+    output: JSON.stringify({ status: "approved" }),
+    expected: { status: "approved" },
+  });
+
+  expect(result.score).toBe(1);
+});
+```
+
+## Verification Expectations
+
+Before committing, run the smallest meaningful check set for the files touched.
+Common commands:
+
+```bash
+pnpm typecheck
+pnpm docs:check
+pnpm test
+pnpm test:visual   # report UI changes
+pnpm build
+pnpm evals
+```
+
+When working on docs or structure-only changes, at minimum re-scan the repo for
+stale references that would mislead contributors or users.
